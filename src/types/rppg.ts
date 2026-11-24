@@ -116,6 +116,12 @@ export interface PoincarePoint {
   ibiNext: number;
 }
 
+export type RespStatus =
+  | "calibrating"
+  | "breathing"
+  | "breath_hold"
+  | "low_signal";
+
 export interface RppgMetrics {
   bpm: number | null;
   rawFftBpm: number | null;
@@ -142,6 +148,9 @@ export interface RppgMetrics {
   respFreqHz: number | null;
   respWaveform: number[];
   respPeakIndices: number[];
+  respStatus?: RespStatus;
+  breathHoldSeconds?: number;
+  respModulationPct?: number;
   roiWeights: {
     forehead: number;
     leftCheek: number;

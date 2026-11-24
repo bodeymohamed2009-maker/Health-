@@ -2,6 +2,7 @@ import type {
   AwbTelemetry,
   CaptureMode,
   PoincarePoint,
+  RespStatus,
   RgbSample,
   RppgAlgorithm,
   RppgMetrics,
@@ -1927,6 +1928,9 @@ function estimateRespiration(
   respWaveform: number[];
   respPeakIndices: number[];
   coherencePct: number | null;
+  respStatus: RespStatus;
+  breathHoldSeconds: number;
+  respModulationPct: number;
 } {
   const N = g30.length;
   if (N < TARGET_FS * 4) {
@@ -1937,6 +1941,9 @@ function estimateRespiration(
       respWaveform: [],
       respPeakIndices: [],
       coherencePct: null,
+      respStatus: "calibrating",
+      breathHoldSeconds: 0,
+      respModulationPct: 0,
     };
   }
 
@@ -2044,6 +2051,9 @@ function estimateRespiration(
       respWaveform: [],
       respPeakIndices: [],
       coherencePct: null,
+      respStatus: "calibrating",
+      breathHoldSeconds: 0,
+      respModulationPct: 0,
     };
   }
 
@@ -2080,6 +2090,50 @@ function estimateRespiration(
   const stdI = stdDev(filtRiiv) || 1;
   const stdF = stdDev(filtRifv) || 1;
 
+  // Un-normalized physical respiratory modulation signals (preserves true amplitude collapse during breath-hold)
+  const meanRiav = Math.max(1e-4, mean(riav4));
+  const relRiav = new Float64Array(outLen);
+  for (let i = 0; i < outLen; i++) {
+    relRiav[i] = filtRiav[i] / meanRiav;
+  }
+
+  const localRms = (arr: Float64Array, center: number, halfW: number) => {
+    const lo = Math.max(0, center - halfW);
+    const hi = Math.min(arr.length - 1, center + halfW);
+    let sq = 0;
+    let cnt = 0;
+    for (let k = lo; k <= hi; k++) {
+      sq += arr[k] * arr[k];
+      cnt++;
+    }
+    return cnt > 0 ? Math.sqrt(sq / cnt) : 0;
+  };
+
+  // Sliding 2.5s respiratory modulation envelope (1.0 ≈ nominal resting breathing)
+  const compositeEnv = new Float64Array(outLen);
+  for (let i = 0; i < outLen; i++) {
+    const normA = localRms(relRiav, i, 5) / 0.055;
+    const normI = localRms(filtRiiv, i, 5) / 0.00055;
+    const normF = hasRifv ? localRms(filtRifv, i, 5) / 1.15 : 0;
+    compositeEnv[i] = hasRifv
+      ? 0.44 * normA + 0.22 * normI + 0.34 * normF
+      : 0.65 * normA + 0.35 * normI;
+  }
+
+  // Compare recent ~5s respiratory modulation vs earlier breathing baseline
+  const recentTailLen = Math.min(outLen, 20); // 5.0s at 4 Hz
+  const recentSlice = compositeEnv.subarray(outLen - recentTailLen);
+  const recentEnv = mean(recentSlice);
+
+  const earlierEnd = Math.max(0, outLen - recentTailLen);
+  let baselineEnv = 0;
+  if (earlierEnd >= 12) {
+    const earlierSorted = Array.from(compositeEnv.subarray(0, earlierEnd)).sort(
+      (a, b) => a - b
+    );
+    baselineEnv = earlierSorted[Math.floor(earlierSorted.length * 0.7)];
+  }
+
   const snrA = computeRespComponentSnr(filtRiav);
   const snrI = computeRespComponentSnr(filtRiiv);
   const snrF = hasRifv ? computeRespComponentSnr(filtRifv) : -20;
@@ -2098,10 +2152,54 @@ function estimateRespiration(
       wSum;
   }
 
-  const fusedStd = stdDev(fused) || 1;
-  const respWaveform = Array.from(fused).map((v) =>
-    Math.max(-3.0, Math.min(3.0, v / fusedStd))
+  const recentFusedLen = Math.min(outLen, 32);
+  const recentRespSnrDb =
+    recentFusedLen >= 20
+      ? computeRespComponentSnr(fused.subarray(outLen - recentFusedLen))
+      : 0;
+
+  const holdThresh =
+    baselineEnv >= 0.48 ? Math.max(0.32, baselineEnv * 0.42) : 0.34;
+  let suppressedSamples = 0;
+  for (let i = outLen - 1; i >= 0; i--) {
+    if (compositeEnv[i] < holdThresh) {
+      suppressedSamples++;
+    } else {
+      break;
+    }
+  }
+  const rawHoldSec = suppressedSamples / RESP_FS;
+
+  const sharpDropFromBreathing =
+    baselineEnv >= 0.48 && recentEnv < baselineEnv * 0.38 && recentEnv < 0.56;
+  const flatAbsoluteModulation = recentEnv < 0.28 && durationSec >= 9.0;
+  const weakSpectralAndLowEnv =
+    recentEnv < 0.46 && recentRespSnrDb < 0.5 && rawHoldSec >= 4.2;
+
+  const isBreathHold =
+    durationSec >= 8.5 &&
+    signalState !== "no_skin" &&
+    signalState !== "low_light" &&
+    signalState !== "motion" &&
+    (rawHoldSec >= 4.2 ||
+      sharpDropFromBreathing ||
+      flatAbsoluteModulation ||
+      weakSpectralAndLowEnv);
+
+  const breathHoldSeconds = isBreathHold
+    ? Number(Math.max(4.5, rawHoldSec).toFixed(1))
+    : 0;
+  const respModulationPct = Math.max(
+    0,
+    Math.min(100, Math.round(recentEnv * 45))
   );
+
+  // Attenuate waveform regions where physical modulation collapsed so breath-hold visibly flattens
+  const fusedStd = stdDev(fused) || 1;
+  const respWaveform = Array.from(fused).map((v, idx) => {
+    const envGain = Math.min(1, Math.max(0.06, compositeEnv[idx] / 0.45));
+    return Math.max(-3.0, Math.min(3.0, (v / fusedStd) * envGain));
+  });
 
   const respPeakIndices: number[] = [];
   const minBreathDist = Math.round(1.8 * RESP_FS);
@@ -2162,24 +2260,40 @@ function estimateRespiration(
   );
 
   const validResp =
+    !isBreathHold &&
     durationSec >= MIN_SECONDS_FOR_RESPIRATION &&
     respSnrDb >= 0.0 &&
-    signalState !== "no_skin"
+    signalState !== "no_skin" &&
+    signalState !== "low_light"
       ? estimatedBrpm
       : null;
 
   const coherencePct =
-    validResp !== null && hasRifv
+    !isBreathHold && validResp !== null && hasRifv
       ? computeCardiorespiratoryCoherence(filtRiav, filtRifv)
       : null;
 
+  const respStatus: RespStatus =
+    signalState === "no_skin" || signalState === "low_light"
+      ? "low_signal"
+      : isBreathHold
+      ? "breath_hold"
+      : validResp !== null
+      ? "breathing"
+      : durationSec < MIN_SECONDS_FOR_RESPIRATION
+      ? "calibrating"
+      : "low_signal";
+
   return {
     respirationBrpm: validResp,
-    respSnrDb,
+    respSnrDb: isBreathHold ? Number(Math.min(respSnrDb, recentRespSnrDb).toFixed(1)) : respSnrDb,
     respFreqHz: validResp ? Number(respFreqHz.toFixed(3)) : null,
     respWaveform,
     respPeakIndices,
     coherencePct,
+    respStatus,
+    breathHoldSeconds,
+    respModulationPct,
   };
 }
 
@@ -2257,6 +2371,9 @@ export function analyzeRppgBuffer(
       respFreqHz: null,
       respWaveform: [],
       respPeakIndices: [],
+      respStatus: "calibrating",
+      breathHoldSeconds: 0,
+      respModulationPct: 0,
       roiWeights: { forehead: 34, leftCheek: 33, rightCheek: 33 },
       fps,
       skinCoveragePct: Math.round(avgSkin),
@@ -2550,6 +2667,9 @@ export function analyzeRppgBuffer(
     respFreqHz: resp.respFreqHz,
     respWaveform: resp.respWaveform,
     respPeakIndices: resp.respPeakIndices,
+    respStatus: resp.respStatus,
+    breathHoldSeconds: resp.breathHoldSeconds,
+    respModulationPct: resp.respModulationPct,
     roiWeights,
     fps,
     skinCoveragePct: Math.round(avgSkin),

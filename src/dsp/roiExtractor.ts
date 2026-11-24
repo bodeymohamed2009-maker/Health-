@@ -76,8 +76,13 @@ export class RoiFrameExtractor {
 
   private nativeDetector: NativeFaceDetectorInstance | null = null;
   private nativeHint: { box: FaceBox; ts: number } | null = null;
+  private nativeSupportConfirmed = false;
+  private nativeLastEmptyTs = 0;
   private lastNativeDetectAttempt = 0;
   private nativeDetectInFlight = false;
+  private consecutiveFaceFrames = 0;
+  private consecutiveMissFrames = 0;
+  private hasLockedFace = false;
 
   constructor() {
     if (typeof window !== "undefined") {
@@ -111,8 +116,13 @@ export class RoiFrameExtractor {
     this.awbGainB = 1;
     this.smoothColorTempK = 5500;
     this.nativeHint = null;
+    this.nativeSupportConfirmed = false;
+    this.nativeLastEmptyTs = 0;
     this.lastNativeDetectAttempt = 0;
     this.nativeDetectInFlight = false;
+    this.consecutiveFaceFrames = 0;
+    this.consecutiveMissFrames = 0;
+    this.hasLockedFace = false;
   }
 
   /**
@@ -136,15 +146,16 @@ export class RoiFrameExtractor {
     this.nativeDetector
       .detect(video)
       .then((faces) => {
+        this.nativeSupportConfirmed = true;
         if (faces && faces.length > 0) {
           const face = faces[0];
           const bb = face.boundingBox;
           const vw = video.videoWidth || 640;
           const vh = video.videoHeight || 480;
-          const cx = Math.max(0.15, Math.min(0.85, (bb.x + bb.width * 0.5) / vw));
-          const cy = Math.max(0.15, Math.min(0.85, (bb.y + bb.height * 0.48) / vh));
-          const rx = Math.max(0.11, Math.min(0.32, (bb.width * 0.5) / vw));
-          const ry = Math.max(0.16, Math.min(0.42, (bb.height * 0.52) / vh));
+          const cx = Math.max(0.08, Math.min(0.92, (bb.x + bb.width * 0.5) / vw));
+          const cy = Math.max(0.08, Math.min(0.92, (bb.y + bb.height * 0.48) / vh));
+          const rx = Math.max(0.08, Math.min(0.36, (bb.width * 0.5) / vw));
+          const ry = Math.max(0.12, Math.min(0.46, (bb.height * 0.52) / vh));
 
           let headTiltDeg = 0;
           const eyePoints =
@@ -167,10 +178,14 @@ export class RoiFrameExtractor {
             box: { cx, cy, rx, ry, headTiltDeg },
             ts: performance.now(),
           };
+          this.nativeLastEmptyTs = 0;
+        } else {
+          this.nativeHint = null;
+          this.nativeLastEmptyTs = performance.now();
         }
       })
       .catch(() => {
-        // Fallback cluster detector remains active on any browser restriction
+        // Fallback structural detector remains active on any browser restriction
       })
       .finally(() => {
         this.nativeDetectInFlight = false;
@@ -322,8 +337,14 @@ export class RoiFrameExtractor {
     const sx1 = Math.floor(width * 0.96);
     const sy1 = Math.floor(height * 0.94);
 
+    const nowTs = performance.now();
     const hasFreshNativeHint =
-      this.nativeHint !== null && performance.now() - this.nativeHint.ts < 450;
+      this.nativeHint !== null && nowTs - this.nativeHint.ts < 450;
+    const nativeConfirmedNoFace =
+      this.nativeSupportConfirmed &&
+      !hasFreshNativeHint &&
+      this.nativeLastEmptyTs > 0 &&
+      nowTs - this.nativeLastEmptyTs < 650;
 
     let roughCx = hasFreshNativeHint ? this.nativeHint!.box.cx : this.smoothCx;
     let roughCy = hasFreshNativeHint ? this.nativeHint!.box.cy : this.smoothCy;
@@ -331,22 +352,33 @@ export class RoiFrameExtractor {
     const GRID_COLS = 8;
     const GRID_ROWS = 6;
     const gridCounts = new Int32Array(GRID_COLS * GRID_ROWS);
+    const gridTotals = new Int32Array(GRID_COLS * GRID_ROWS);
     const gridSumX = new Float64Array(GRID_COLS * GRID_ROWS);
     const gridSumY = new Float64Array(GRID_COLS * GRID_ROWS);
     let totalSkin1A = 0;
+    let totalSamples1A = 0;
 
     for (let y = sy0; y <= sy1; y += 2) {
       for (let x = sx0; x <= sx1; x += 2) {
+        const nx = x / width;
+        const ny = y / height;
+        const gc = Math.min(GRID_COLS - 1, Math.floor(nx * GRID_COLS));
+        const gr = Math.min(GRID_ROWS - 1, Math.floor(ny * GRID_ROWS));
+        const gi = gr * GRID_COLS + gc;
+        gridTotals[gi]++;
+        totalSamples1A++;
+
         const idx = (y * width + x) * 4;
-        const r = Math.min(255, data[idx] * gR);
-        const g = Math.min(255, data[idx + 1] * gG);
-        const b = Math.min(255, data[idx + 2] * gB);
-        if (isFacialSkinPixel(r, g, b)) {
-          const nx = x / width;
-          const ny = y / height;
-          const gc = Math.min(GRID_COLS - 1, Math.floor(nx * GRID_COLS));
-          const gr = Math.min(GRID_ROWS - 1, Math.floor(ny * GRID_ROWS));
-          const gi = gr * GRID_COLS + gc;
+        const rawR = data[idx];
+        const rawG = data[idx + 1];
+        const rawB = data[idx + 2];
+        const r = Math.min(255, rawR * gR);
+        const g = Math.min(255, rawG * gG);
+        const b = Math.min(255, rawB * gB);
+        if (
+          isFacialSkinPixel(r, g, b) ||
+          (enableAwb && isFacialSkinPixel(rawR, rawG, rawB))
+        ) {
           gridCounts[gi]++;
           gridSumX[gi] += nx;
           gridSumY[gi] += ny;
@@ -355,8 +387,23 @@ export class RoiFrameExtractor {
       }
     }
 
-    if (totalSkin1A >= 30 && !hasFreshNativeHint) {
-      // Find peak 2x2 neighborhood in the 8x6 grid to lock onto primary facial cluster
+    // Measure whether skin pixels are a compact facial cluster vs a full-frame wall/backdrop
+    let edgeSkinCount = 0;
+    let edgeTotalCount = 0;
+    for (let gr = 0; gr < GRID_ROWS; gr++) {
+      for (let gc = 0; gc < GRID_COLS; gc++) {
+        if (gr === 0 || gr === GRID_ROWS - 1 || gc === 0 || gc === GRID_COLS - 1) {
+          const gi = gr * GRID_COLS + gc;
+          edgeSkinCount += gridCounts[gi];
+          edgeTotalCount += gridTotals[gi];
+        }
+      }
+    }
+    const edgeSkinRatio = edgeTotalCount > 0 ? edgeSkinCount / edgeTotalCount : 0;
+    const frameSkinRatio = totalSamples1A > 0 ? totalSkin1A / totalSamples1A : 0;
+
+    let bestClusterScore = 0;
+    if (totalSkin1A >= 45 && !hasFreshNativeHint) {
       let bestScore = -1;
       let bestX = this.smoothCx;
       let bestY = this.smoothCy;
@@ -364,27 +411,31 @@ export class RoiFrameExtractor {
       for (let gr = 0; gr < GRID_ROWS - 1; gr++) {
         for (let gc = 0; gc < GRID_COLS - 1; gc++) {
           let cnt = 0;
+          let tot = 0;
           let sx = 0;
           let sy = 0;
           for (let dr = 0; dr <= 1; dr++) {
             for (let dc = 0; dc <= 1; dc++) {
               const gi = (gr + dr) * GRID_COLS + (gc + dc);
               cnt += gridCounts[gi];
+              tot += gridTotals[gi];
               sx += gridSumX[gi];
               sy += gridSumY[gi];
             }
           }
-          if (cnt > bestScore) {
-            bestScore = cnt;
-            if (cnt > 0) {
-              bestX = sx / cnt;
-              bestY = sy / cnt;
-            }
+          // Prefer dense localized skin cluster over faint scattered background hits
+          const density = tot > 0 ? cnt / tot : 0;
+          const weightedScore = cnt * (0.65 + density);
+          if (weightedScore > bestScore && cnt >= 35) {
+            bestScore = weightedScore;
+            bestClusterScore = cnt;
+            bestX = sx / cnt;
+            bestY = sy / cnt;
           }
         }
       }
 
-      if (bestScore >= 18) {
+      if (bestClusterScore >= 35) {
         roughCx = bestX;
         roughCy = bestY;
       }
@@ -405,10 +456,16 @@ export class RoiFrameExtractor {
     for (let y = ty0; y <= ty1; y += 2) {
       for (let x = tx0; x <= tx1; x += 2) {
         const idx = (y * width + x) * 4;
-        const r = Math.min(255, data[idx] * gR);
-        const g = Math.min(255, data[idx + 1] * gG);
-        const b = Math.min(255, data[idx + 2] * gB);
-        if (isFacialSkinPixel(r, g, b)) {
+        const rawR = data[idx];
+        const rawG = data[idx + 1];
+        const rawB = data[idx + 2];
+        const r = Math.min(255, rawR * gR);
+        const g = Math.min(255, rawG * gG);
+        const b = Math.min(255, rawB * gB);
+        if (
+          isFacialSkinPixel(r, g, b) ||
+          (enableAwb && isFacialSkinPixel(rawR, rawG, rawB))
+        ) {
           const nx = x / width;
           const ny = y / height;
           sumX2 += nx;
@@ -420,9 +477,16 @@ export class RoiFrameExtractor {
       }
     }
 
-    const faceDetected = count2 >= 36 || hasFreshNativeHint;
+    const minClusterSkinPts = Math.max(85, Math.round((width * height) / 480));
+    const uniformBackdropSuspect =
+      !hasFreshNativeHint &&
+      edgeSkinRatio > 0.52 &&
+      frameSkinRatio > 0.56 &&
+      edgeSkinRatio > frameSkinRatio * 0.82;
 
-    if (count2 >= 36) {
+    const clusterCandidate = count2 >= minClusterSkinPts && !uniformBackdropSuspect;
+
+    if (clusterCandidate) {
       const meanX = sumX2 / count2;
       const meanY = sumY2 / count2;
       const varX = Math.max(0.002, sumXX / count2 - meanX * meanX);
@@ -432,38 +496,41 @@ export class RoiFrameExtractor {
 
       let targetCx = meanX;
       let targetCy = meanY;
-      let targetRx = Math.max(0.10, Math.min(0.34, stdX * 2.05));
-      let targetRy = Math.max(0.16, Math.min(0.44, stdY * 2.15));
+      let targetRx = Math.max(0.095, Math.min(0.35, stdX * 2.05));
+      let targetRy = Math.max(0.15, Math.min(0.45, stdY * 2.15));
 
       if (hasFreshNativeHint) {
         const nb = this.nativeHint!.box;
-        targetCx = nb.cx * 0.7 + meanX * 0.3;
-        targetCy = nb.cy * 0.7 + meanY * 0.3;
-        targetRx = nb.rx * 0.72 + targetRx * 0.28;
-        targetRy = nb.ry * 0.72 + targetRy * 0.28;
+        targetCx = nb.cx * 0.72 + meanX * 0.28;
+        targetCy = nb.cy * 0.72 + meanY * 0.28;
+        targetRx = nb.rx * 0.74 + targetRx * 0.26;
+        targetRy = nb.ry * 0.74 + targetRy * 0.26;
       }
 
       const shift = Math.hypot(targetCx - this.smoothCx, targetCy - this.smoothCy);
-      // Deadband hysteresis eliminates sub-pixel ROI wobble when head is steady
-      const alpha =
-        shift > 0.08
-          ? 0.56
-          : shift > 0.03
-          ? 0.34
-          : shift > 0.008
-          ? 0.16
-          : 0.06;
-      const sizeAlpha = shift > 0.05 ? 0.22 : 0.10;
+      // Fast snap on initial lock or large head jumps, deadband hysteresis when steady
+      const alpha = !this.hasLockedFace
+        ? 0.92
+        : shift > 0.15
+        ? 0.84
+        : shift > 0.08
+        ? 0.62
+        : shift > 0.03
+        ? 0.36
+        : shift > 0.008
+        ? 0.18
+        : 0.07;
+      const sizeAlpha = !this.hasLockedFace ? 0.6 : shift > 0.05 ? 0.28 : 0.12;
       this.smoothCx = this.smoothCx * (1 - alpha) + targetCx * alpha;
       this.smoothCy = this.smoothCy * (1 - alpha) + targetCy * alpha;
       this.smoothRx = this.smoothRx * (1 - sizeAlpha) + targetRx * sizeAlpha;
       this.smoothRy = this.smoothRy * (1 - sizeAlpha) + targetRy * sizeAlpha;
     } else if (hasFreshNativeHint) {
       const nb = this.nativeHint!.box;
-      this.smoothCx = this.smoothCx * 0.55 + nb.cx * 0.45;
-      this.smoothCy = this.smoothCy * 0.55 + nb.cy * 0.45;
-      this.smoothRx = this.smoothRx * 0.78 + nb.rx * 0.22;
-      this.smoothRy = this.smoothRy * 0.78 + nb.ry * 0.22;
+      this.smoothCx = this.smoothCx * 0.5 + nb.cx * 0.5;
+      this.smoothCy = this.smoothCy * 0.5 + nb.cy * 0.5;
+      this.smoothRx = this.smoothRx * 0.72 + nb.rx * 0.28;
+      this.smoothRy = this.smoothRy * 0.72 + nb.ry * 0.28;
     }
 
     const cx = this.smoothCx;
@@ -472,60 +539,90 @@ export class RoiFrameExtractor {
     const ry = this.smoothRy;
     const clamp01 = (v: number) => Math.max(0.01, Math.min(0.99, v));
 
-    // Ocular luminance-valley detector + Chromium landmark tilt fusion
+    // Ocular luminance-valley detector + structural facial symmetry check
     let targetTiltDeg = this.nativeHint?.box.headTiltDeg ?? 0;
-    if (
-      faceDetected &&
-      (!hasFreshNativeHint || this.nativeHint?.box.headTiltDeg === undefined)
-    ) {
-      const findEyeValley = (xStartN: number, xEndN: number) => {
-        const px0 = Math.max(2, Math.floor(clamp01(xStartN) * width));
-        const px1 = Math.min(width - 3, Math.floor(clamp01(xEndN) * width));
-        const py0 = Math.max(2, Math.floor(clamp01(cy - 0.34 * ry) * height));
-        const py1 = Math.min(height - 3, Math.floor(clamp01(cy + 0.04 * ry) * height));
-        let minAvg = 999;
-        let maxAvg = 0;
-        let bestX = (px0 + px1) * 0.5;
-        let bestY = (py0 + py1) * 0.5;
-        for (let y = py0; y <= py1; y += 2) {
-          for (let x = px0; x <= px1; x += 2) {
-            let lumaSum = 0;
-            for (let dy = -1; dy <= 1; dy++) {
-              for (let dx = -1; dx <= 1; dx++) {
-                const i4 = ((y + dy) * width + (x + dx)) * 4;
-                lumaSum +=
-                  0.299 * data[i4] + 0.587 * data[i4 + 1] + 0.114 * data[i4 + 2];
-              }
-            }
-            const avg = lumaSum / 9;
-            if (avg > maxAvg) maxAvg = avg;
-            if (avg < minAvg) {
-              minAvg = avg;
-              bestX = x;
-              bestY = y;
+    let bilateralOcularStructure = false;
+
+    const findEyeValley = (xStartN: number, xEndN: number) => {
+      const px0 = Math.max(2, Math.floor(clamp01(xStartN) * width));
+      const px1 = Math.min(width - 3, Math.floor(clamp01(xEndN) * width));
+      const py0 = Math.max(2, Math.floor(clamp01(cy - 0.36 * ry) * height));
+      const py1 = Math.min(height - 3, Math.floor(clamp01(cy + 0.06 * ry) * height));
+      let minAvg = 999;
+      let maxAvg = 0;
+      let bestX = (px0 + px1) * 0.5;
+      let bestY = (py0 + py1) * 0.5;
+      for (let y = py0; y <= py1; y += 2) {
+        for (let x = px0; x <= px1; x += 2) {
+          let lumaSum = 0;
+          for (let dy = -1; dy <= 1; dy++) {
+            for (let dx = -1; dx <= 1; dx++) {
+              const i4 = ((y + dy) * width + (x + dx)) * 4;
+              lumaSum +=
+                0.299 * data[i4] + 0.587 * data[i4 + 1] + 0.114 * data[i4 + 2];
             }
           }
+          const avg = lumaSum / 9;
+          if (avg > maxAvg) maxAvg = avg;
+          if (avg < minAvg) {
+            minAvg = avg;
+            bestX = x;
+            bestY = y;
+          }
         }
-        return {
-          x: bestX / width,
-          y: bestY / height,
-          contrast: maxAvg - minAvg,
-        };
+      }
+      return {
+        x: bestX / width,
+        y: bestY / height,
+        minAvg,
+        maxAvg,
+        contrast: maxAvg - minAvg,
       };
+    };
 
-      const leftEye = findEyeValley(cx - 0.60 * rx, cx - 0.14 * rx);
-      const rightEye = findEyeValley(cx + 0.14 * rx, cx + 0.60 * rx);
-      if (leftEye.contrast > 18 && rightEye.contrast > 18) {
-        const dx = (rightEye.x - leftEye.x) * width;
-        const dy = (rightEye.y - leftEye.y) * height;
-        if (dx > 10) {
-          const deg = (Math.atan2(dy, dx) * 180) / Math.PI;
-          if (Math.abs(deg) <= 20) {
-            targetTiltDeg = deg;
+    if (clusterCandidate || hasFreshNativeHint) {
+      const leftEye = findEyeValley(cx - 0.62 * rx, cx - 0.12 * rx);
+      const rightEye = findEyeValley(cx + 0.12 * rx, cx + 0.62 * rx);
+      const eyeSeparationX = rightEye.x - leftEye.x;
+      const eyeDiffY = Math.abs(leftEye.y - rightEye.y);
+
+      const fhX0 = Math.max(1, Math.floor(clamp01(cx - 0.3 * rx) * width));
+      const fhX1 = Math.min(width - 2, Math.floor(clamp01(cx + 0.3 * rx) * width));
+      const fhY0 = Math.max(1, Math.floor(clamp01(cy - 0.62 * ry) * height));
+      const fhY1 = Math.min(height - 2, Math.floor(clamp01(cy - 0.42 * ry) * height));
+      let fhSum = 0;
+      let fhCnt = 0;
+      for (let y = fhY0; y <= fhY1; y += 2) {
+        for (let x = fhX0; x <= fhX1; x += 2) {
+          const i4 = (y * width + x) * 4;
+          fhSum += 0.299 * data[i4] + 0.587 * data[i4 + 1] + 0.114 * data[i4 + 2];
+          fhCnt++;
+        }
+      }
+      const foreheadLuma = fhCnt > 0 ? fhSum / fhCnt : 0;
+
+      if (
+        leftEye.contrast >= 12 &&
+        rightEye.contrast >= 12 &&
+        foreheadLuma >= leftEye.minAvg + 4 &&
+        foreheadLuma >= rightEye.minAvg + 4 &&
+        eyeSeparationX >= Math.max(0.035, 0.28 * rx) &&
+        eyeDiffY <= Math.max(0.055, 0.26 * ry)
+      ) {
+        bilateralOcularStructure = true;
+        if (!hasFreshNativeHint || this.nativeHint?.box.headTiltDeg === undefined) {
+          const dx = (rightEye.x - leftEye.x) * width;
+          const dy = (rightEye.y - leftEye.y) * height;
+          if (dx > 10) {
+            const deg = (Math.atan2(dy, dx) * 180) / Math.PI;
+            if (Math.abs(deg) <= 20) {
+              targetTiltDeg = deg;
+            }
           }
         }
       }
     }
+
     this.smoothTiltDeg = this.smoothTiltDeg * 0.82 + targetTiltDeg * 0.18;
     const tiltRad = (this.smoothTiltDeg * Math.PI) / 180;
     const cosT = Math.cos(tiltRad);
@@ -644,7 +741,10 @@ export class RoiFrameExtractor {
             continue;
           }
 
-          if (isFacialSkinPixel(r, g, b)) {
+          if (
+            isFacialSkinPixel(r, g, b) ||
+            (enableAwb && isFacialSkinPixel(rawR, rawG, rawB))
+          ) {
             zoneR.push(r);
             zoneG.push(g);
             zoneB.push(b);
@@ -730,21 +830,75 @@ export class RoiFrameExtractor {
     const brightness =
       totalSkinCount > 0 ? totalSumLuma / totalSkinCount : centerRawLuma;
 
-    // Free-roaming face zone: pauses only if face vanishes, clips outside sensor edge, too dark, or too small
+    const validRegionCount =
+      (regionResults.forehead.valid ? 1 : 0) +
+      (regionResults.leftCheek.valid ? 1 : 0) +
+      (regionResults.rightCheek.valid ? 1 : 0);
+
+    // Confirm real human face via Chromium FaceDetector OR bilateral eye-valley + multi-ROI skin geometry
+    const rawFaceVerified =
+      hasFreshNativeHint ||
+      (!nativeConfirmedNoFace &&
+        clusterCandidate &&
+        bilateralOcularStructure &&
+        validRegionCount >= 2 &&
+        skinCoveragePct >= 28);
+
+    if (rawFaceVerified) {
+      this.consecutiveFaceFrames++;
+      this.consecutiveMissFrames = 0;
+      if (this.consecutiveFaceFrames >= 2) {
+        this.hasLockedFace = true;
+      }
+    } else {
+      this.consecutiveFaceFrames = 0;
+      this.consecutiveMissFrames++;
+      if (this.consecutiveMissFrames >= 4) {
+        this.hasLockedFace = false;
+      }
+      // Gently return tracking reticle toward center after prolonged absence
+      if (this.consecutiveMissFrames > 12) {
+        this.smoothCx = this.smoothCx * 0.9 + 0.5 * 0.1;
+        this.smoothCy = this.smoothCy * 0.9 + 0.46 * 0.1;
+        this.smoothRx = this.smoothRx * 0.9 + 0.2 * 0.1;
+        this.smoothRy = this.smoothRy * 0.9 + 0.32 * 0.1;
+      }
+    }
+
+    const faceDetected = rawFaceVerified || this.hasLockedFace;
+    const isNearEdge =
+      cx - rx * 0.9 < 0.025 ||
+      cx + rx * 0.9 > 0.975 ||
+      cy - ry * 0.9 < 0.025 ||
+      cy + ry * 0.9 > 0.975 ||
+      cx < 0.12 ||
+      cx > 0.88 ||
+      cy < 0.12 ||
+      cy > 0.88;
+
+    // Free-roaming face zone: pauses if face vanishes, clips outside sensor edge, too dark, or wrong distance
     let zoneGuidance: ZoneGuidance = "ok";
     if (centerRawLuma < 36 || (totalSkinCount > 0 && brightness < 38)) {
       zoneGuidance = "low_light";
-    } else if (!faceDetected || totalSkinCount < 25 || skinCoveragePct < 15) {
-      zoneGuidance = "no_face";
-    } else if (cx < 0.09 || cx > 0.91 || cy < 0.09 || cy > 0.91) {
+    } else if (
+      isNearEdge &&
+      (faceDetected || (clusterCandidate && validRegionCount >= 1 && skinCoveragePct >= 18))
+    ) {
       zoneGuidance = "off_center";
+    } else if (
+      !faceDetected ||
+      totalSkinCount < 40 ||
+      skinCoveragePct < 24 ||
+      validRegionCount < 2
+    ) {
+      zoneGuidance = "no_face";
     } else if (rx < 0.105 && !hasFreshNativeHint) {
       zoneGuidance = "too_far";
     } else if (rx > 0.355 && ry > 0.435) {
       zoneGuidance = "too_close";
     }
 
-    const inZone = zoneGuidance === "ok";
+    const inZone = zoneGuidance === "ok" && this.hasLockedFace;
 
     const roiBoxes: RoiBox[] = [
       ...zones.map((z) => ({
@@ -781,7 +935,7 @@ export class RoiFrameExtractor {
       headTiltDeg: Number(this.smoothTiltDeg.toFixed(1)),
     };
 
-    if (totalSkinCount < 25) {
+    if (!faceDetected || totalSkinCount < 40 || !inZone) {
       return {
         r: 0,
         g: 0,
@@ -820,7 +974,7 @@ export class RoiFrameExtractor {
       inZone,
       zoneGuidance,
       roiBoxes,
-      hasValidTarget: inZone && skinCoveragePct >= 15,
+      hasValidTarget: inZone && skinCoveragePct >= 24 && validRegionCount >= 2,
       awb: awbState,
       regions: regionResults,
     };

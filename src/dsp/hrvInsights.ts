@@ -199,6 +199,42 @@ export function evaluateHrvSmartAlert({
     };
   }
 
+  if (
+    isRunning &&
+    metrics.respStatus === "breath_hold"
+  ) {
+    const holdSec = Math.round(metrics.breathHoldSeconds ?? 5);
+    return {
+      id: "resp-breath-hold",
+      tone: "caution",
+      badgeLabel: "كتم النفس / توقف التنفس",
+      headline: `تم رصد توقف مؤقت في التنفس (كتم النفس ~${holdSec} ثوانٍ)`,
+      guidance:
+        "توقّف التضمين التنفسي في موجة النبض واضطراب النظم الجيبي (RSA). استأنف التنفس الهادئ لإعادة احتساب معدل التنفس والتناغم.",
+      chips: [
+        ...(metrics.bpm !== null
+          ? [{ label: "النبض", value: `${metrics.bpm} BPM`, status: "neutral" as const }]
+          : []),
+        {
+          label: "مدة التوقف",
+          value: `${(metrics.breathHoldSeconds ?? 5).toFixed(1)}s`,
+          status: "warn" as const,
+        },
+        ...(metrics.respModulationPct !== undefined
+          ? [
+              {
+                label: "التضمين",
+                value: `${metrics.respModulationPct}%`,
+                status: "warn" as const,
+              },
+            ]
+          : []),
+      ],
+      isLiveReliable: true,
+      ageCalibrated,
+    };
+  }
+
   const sqiOk = metrics.sqiPct === undefined || metrics.sqiPct >= 42;
   if (
     isRunning &&

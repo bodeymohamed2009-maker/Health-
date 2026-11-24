@@ -111,7 +111,7 @@ const INITIAL_METRICS: RppgMetrics = {
 
 function getZoneGuidanceText(guidance: ZoneGuidance, mode: CaptureMode): string {
   if (mode === "finger") {
-    return "أعد تغطية عدسة الكاميرا بإصبعك بلطف لاستئناف القياس";
+    return "غطِّ عدسة الكاميرا بإصبعك بلطف لبدء أو استئناف القياس";
   }
   switch (guidance) {
     case "off_center":
@@ -173,6 +173,8 @@ function getSignalStatusBadge(state: SignalQualityState): {
 
 export default function App() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const viewfinderRef = useRef<HTMLDivElement | null>(null);
+  const coverScaleRef = useRef<{ sx: number; sy: number }>({ sx: 1, sy: 1 });
   const analysisCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const rafRef = useRef<number | null>(null);
@@ -254,6 +256,10 @@ export default function App() {
   const [torchSupported, setTorchSupported] = useState(false);
   const [cameraError, setCameraError] = useState<string | null>(null);
 
+  const [coverScale, setCoverScale] = useState<{ sx: number; sy: number }>({
+    sx: 1,
+    sy: 1,
+  });
   const [roiBoxes, setRoiBoxes] = useState<RoiBox[]>([]);
   const [faceBox, setFaceBox] = useState<FaceBox>({
     cx: 0.5,
@@ -532,19 +538,22 @@ export default function App() {
     scanStartTimeRef.current = nowTs;
     activeElapsedMsRef.current = 0;
     lastTickTimeRef.current = nowTs;
-    isPausedRef.current = false;
-    pauseStartedAtRef.current = null;
+    isPausedRef.current = true;
+    pauseStartedAtRef.current = nowTs;
     outOfZoneSinceRef.current = null;
     inZoneSinceRef.current = null;
     liveBpmRef.current = null;
-    liveSignalStateRef.current = "calibrating";
+    liveSignalStateRef.current = "paused";
     nextBeepAtRef.current = 0;
     lastBeepTimeRef.current = 0;
-    setIsPausedByZone(false);
-    setZoneGuidance("ok");
+    coverScaleRef.current = { sx: 1, sy: 1 };
+    setCoverScale({ sx: 1, sy: 1 });
+    setIsPausedByZone(true);
+    setZoneGuidance("no_face");
     setElapsedSec(0);
+    setRoiBoxes([]);
     setFaceBox({ cx: 0.5, cy: 0.46, rx: 0.2, ry: 0.32 });
-    setMetrics({ ...INITIAL_METRICS, signalState: "calibrating" });
+    setMetrics({ ...INITIAL_METRICS, signalState: "paused" });
 
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       setCameraError(
@@ -631,6 +640,35 @@ export default function App() {
       const video = videoRef.current;
       const canvas = analysisCanvasRef.current;
       if (video && canvas && video.readyState >= 2) {
+        if (video.videoWidth > 0 && video.videoHeight > 0) {
+          const targetW = 240;
+          const targetH = Math.max(
+            120,
+            Math.round((targetW * video.videoHeight) / video.videoWidth)
+          );
+          if (canvas.width !== targetW || canvas.height !== targetH) {
+            canvas.width = targetW;
+            canvas.height = targetH;
+          }
+          const vf = viewfinderRef.current;
+          if (vf && vf.clientWidth > 0 && vf.clientHeight > 0) {
+            const cw = vf.clientWidth;
+            const ch = vf.clientHeight;
+            const coverFactor = Math.max(
+              cw / video.videoWidth,
+              ch / video.videoHeight
+            );
+            const nextSx = (video.videoWidth * coverFactor) / cw;
+            const nextSy = (video.videoHeight * coverFactor) / ch;
+            if (
+              Math.abs(nextSx - coverScaleRef.current.sx) > 0.01 ||
+              Math.abs(nextSy - coverScaleRef.current.sy) > 0.01
+            ) {
+              coverScaleRef.current = { sx: nextSx, sy: nextSy };
+              setCoverScale({ sx: nextSx, sy: nextSy });
+            }
+          }
+        }
         if (mode === "face") {
           extractorRef.current.pollNativeFaceDetector(video, now);
         }
@@ -645,7 +683,7 @@ export default function App() {
           frameInZone = roi.inZone;
 
           // Auto-Pause / Seamless Resume Zone State Machine
-          if (roi.inZone) {
+          if (roi.inZone && roi.hasValidTarget) {
             outOfZoneSinceRef.current = null;
             if (isPausedRef.current) {
               inZoneSinceRef.current ??= now;
@@ -658,7 +696,7 @@ export default function App() {
                   // Long absence: start clean window without stale beats
                   samplesRef.current = [];
                   kalmanRef.current.reset();
-                } else if (pauseDuration > 0) {
+                } else if (pauseDuration > 0 && samplesRef.current.length > 0) {
                   // Temporary departure: shift timestamps forward for gap-free continuity
                   for (const s of samplesRef.current) {
                     s.t += pauseDuration;
@@ -687,6 +725,16 @@ export default function App() {
                   signalState: "paused",
                 }));
               }
+            } else if (now - lastAnalyzeTimeRef.current >= 200) {
+              lastAnalyzeTimeRef.current = now;
+              setMetrics((prev) => ({
+                ...prev,
+                skinCoveragePct: Math.round(roi.skinCoveragePct),
+                brightness: Math.round(roi.brightness),
+                motionIndex: Number(roi.motionIndex.toFixed(1)),
+                specularRejectedPct: Number(roi.specularRejectedPct.toFixed(1)),
+                signalState: "paused",
+              }));
             }
           }
 
@@ -1863,28 +1911,53 @@ export default function App() {
                 className={`text-right bg-white dark:bg-[#0c1322] border transition-all duration-200 rounded-xl p-4 cursor-pointer group ${
                   selectedMetric === "resp"
                     ? "border-teal-700 dark:border-teal-400/70 ring-1 ring-teal-600/35 dark:ring-teal-400/35"
+                    : metrics.respStatus === "breath_hold"
+                    ? "border-amber-500/70 dark:border-amber-400/60"
                     : "border-slate-300 dark:border-slate-800/90 hover:border-slate-400 dark:hover:border-slate-700"
                 }`}
               >
                 <div className="flex items-center justify-between text-xs text-slate-600 dark:text-slate-400 font-medium">
                   <span>معدل التنفس</span>
-                  <Wind className="w-4 h-4 text-teal-700 dark:text-teal-400" />
+                  <Wind
+                    className={`w-4 h-4 ${
+                      metrics.respStatus === "breath_hold"
+                        ? "text-amber-700 dark:text-amber-400"
+                        : "text-teal-700 dark:text-teal-400"
+                    }`}
+                  />
                 </div>
                 <div dir="ltr" className="mt-2 flex items-baseline gap-1.5">
-                  <span className="font-mono text-3xl font-bold text-slate-950 dark:text-white tabular-nums">
-                    {metrics.respirationBrpm !== null
-                      ? metrics.respirationBrpm
-                      : "--"}
-                  </span>
-                  <span className="font-mono text-xs text-slate-600 dark:text-slate-400 uppercase">
-                    BrPM
-                  </span>
+                  {metrics.respStatus === "breath_hold" ? (
+                    <span
+                      dir="rtl"
+                      className="text-xl font-bold text-amber-700 dark:text-amber-300 tracking-tight"
+                    >
+                      كتم النفس
+                    </span>
+                  ) : (
+                    <>
+                      <span className="font-mono text-3xl font-bold text-slate-950 dark:text-white tabular-nums">
+                        {metrics.respirationBrpm !== null
+                          ? metrics.respirationBrpm
+                          : "--"}
+                      </span>
+                      <span className="font-mono text-xs text-slate-600 dark:text-slate-400 uppercase">
+                        BrPM
+                      </span>
+                    </>
+                  )}
                 </div>
                 <p
                   dir="ltr"
-                  className="text-[11px] text-slate-600 dark:text-slate-400 mt-1 font-mono tabular-nums group-hover:text-teal-800 dark:group-hover:text-teal-300/90 transition-colors"
+                  className={`text-[11px] mt-1 font-mono tabular-nums transition-colors ${
+                    metrics.respStatus === "breath_hold"
+                      ? "text-amber-800 dark:text-amber-300 font-semibold"
+                      : "text-slate-600 dark:text-slate-400 group-hover:text-teal-800 dark:group-hover:text-teal-300/90"
+                  }`}
                 >
-                  {metrics.respirationBrpm !== null
+                  {metrics.respStatus === "breath_hold"
+                    ? `Apnea · ${(metrics.breathHoldSeconds ?? 0).toFixed(1)}s hold`
+                    : metrics.respirationBrpm !== null
                     ? `SNR: ${metrics.respSnrDb.toFixed(1)} dB`
                     : `${Math.min(12, metrics.bufferSeconds).toFixed(0)}/12s buffer`}
                 </p>
@@ -2160,7 +2233,10 @@ export default function App() {
                 className="hidden"
               />
 
-              <div className="relative w-full aspect-video max-h-[380px] bg-[#04070c] rounded-lg overflow-hidden border border-slate-800 flex items-center justify-center">
+              <div
+                ref={viewfinderRef}
+                className="relative w-full aspect-video max-h-[380px] bg-[#04070c] rounded-lg overflow-hidden border border-slate-800 flex items-center justify-center"
+              >
                 <video
                   ref={videoRef}
                   autoPlay
@@ -2182,15 +2258,24 @@ export default function App() {
                 {/* Auto-Tracking Moving Face Zone & Dynamic ROI HUD */}
                 {mode !== "finger" &&
                   (() => {
-                    const useLiveZone =
-                      isRunning && mode === "face" && !isPausedByZone;
-                    const zCx = useLiveZone ? (1 - faceBox.cx) * 100 : 50;
-                    const zCy = useLiveZone ? faceBox.cy * 100 : 46;
-                    const zRx = useLiveZone
-                      ? Math.max(13, Math.min(36, faceBox.rx * 112))
+                    const hasFaceTrack =
+                      isRunning &&
+                      mode === "face" &&
+                      zoneGuidance !== "no_face" &&
+                      zoneGuidance !== "low_light";
+                    const projectX = (nx: number) =>
+                      (0.5 + (1 - nx - 0.5) * coverScale.sx) * 100;
+                    const projectY = (ny: number) =>
+                      (0.5 + (ny - 0.5) * coverScale.sy) * 100;
+                    const zCx = hasFaceTrack ? projectX(faceBox.cx) : 50;
+                    const zCy = hasFaceTrack ? projectY(faceBox.cy) : 46;
+                    const rawRx = faceBox.rx * coverScale.sx * 100;
+                    const rawRy = faceBox.ry * coverScale.sy * 100;
+                    const zRx = hasFaceTrack
+                      ? Math.max(12, Math.min(36, rawRx * 1.12))
                       : 21;
-                    const zRy = useLiveZone
-                      ? Math.max(19, Math.min(44, faceBox.ry * 112))
+                    const zRy = hasFaceTrack
+                      ? Math.max(18, Math.min(44, rawRy * 1.12))
                       : 32;
                     const bx0 = Math.max(2, zCx - zRx - 2.5);
                     const bx1 = Math.min(98, zCx + zRx + 2.5);
@@ -2245,20 +2330,34 @@ export default function App() {
                           }
                         />
 
+                        {/* Scanning crosshair when searching for a face */}
+                        {isRunning && !hasFaceTrack && (
+                          <path
+                            d="M 46 46 L 54 46 M 50 40 L 50 52"
+                            fill="none"
+                            stroke="rgba(245, 158, 11, 0.55)"
+                            strokeWidth="0.45"
+                          />
+                        )}
+
                         {/* Inner Face Contour Ring (rotates subtly with ocular head-tilt) */}
-                        {useLiveZone && (
+                        {hasFaceTrack && (
                           <ellipse
-                            cx={(1 - faceBox.cx) * 100}
-                            cy={faceBox.cy * 100}
-                            rx={faceBox.rx * 100}
-                            ry={faceBox.ry * 100}
+                            cx={zCx}
+                            cy={zCy}
+                            rx={rawRx}
+                            ry={rawRy}
                             transform={
                               faceBox.headTiltDeg
-                                ? `rotate(${-faceBox.headTiltDeg} ${(1 - faceBox.cx) * 100} ${faceBox.cy * 100})`
+                                ? `rotate(${-faceBox.headTiltDeg} ${zCx} ${zCy})`
                                 : undefined
                             }
                             fill="none"
-                            stroke="rgba(34, 211, 238, 0.45)"
+                            stroke={
+                              isPausedByZone
+                                ? "rgba(245, 158, 11, 0.55)"
+                                : "rgba(34, 211, 238, 0.45)"
+                            }
                             strokeWidth="0.35"
                             strokeDasharray="1 1"
                           />
@@ -2271,16 +2370,21 @@ export default function App() {
                           roiBoxes.map((box) => {
                             const mirroredX =
                               mode === "face"
-                                ? (1 - box.x - box.w) * 100
-                                : box.x * 100;
+                                ? (0.5 + (1 - box.x - box.w - 0.5) * coverScale.sx) *
+                                  100
+                                : (0.5 + (box.x - 0.5) * coverScale.sx) * 100;
+                            const projY =
+                              (0.5 + (box.y - 0.5) * coverScale.sy) * 100;
+                            const projW = box.w * coverScale.sx * 100;
+                            const projH = box.h * coverScale.sy * 100;
                             const isBg = box.kind === "background";
                             return (
                               <g key={box.label}>
                                 <rect
                                   x={mirroredX}
-                                  y={box.y * 100}
-                                  width={box.w * 100}
-                                  height={box.h * 100}
+                                  y={projY}
+                                  width={projW}
+                                  height={projH}
                                   fill={
                                     isBg
                                       ? "rgba(148, 163, 184, 0.08)"
@@ -2308,7 +2412,11 @@ export default function App() {
                       }`}
                     >
                       {isPausedByZone
-                        ? "⏸ متوقف مؤقتاً · بانتظار ظهور الوجه"
+                        ? mode === "finger"
+                          ? "⏸ متوقف · بانتظار تغطية العدسة بالإصبع"
+                          : elapsedSec === 0
+                          ? "⏸ جاري البحث عن الوجه في الكادر..."
+                          : "⏸ متوقف مؤقتاً · بانتظار عودة الوجه"
                         : mode === "face"
                         ? `● تتبع الوجه مقفل · تغطية ${metrics.skinCoveragePct}%`
                         : "● الإصبع مثبت على العدسة"}
@@ -2330,7 +2438,7 @@ export default function App() {
                   )}
                 </AnimatePresence>
 
-                {/* Translucent Pause Banner when user temporarily leaves the frame */}
+                {/* Translucent Pause Banner when user has not entered or left the frame */}
                 <AnimatePresence>
                   {isRunning && isPausedByZone && (
                     <motion.div
@@ -2342,7 +2450,11 @@ export default function App() {
                     >
                       <div className="bg-slate-950/90 border border-amber-500/50 rounded-lg px-4 py-2.5 text-center shadow-lg max-w-md">
                         <p className="text-xs font-bold text-amber-300">
-                          تم إيقاف المؤقت والبيانات مؤقتاً لحين عودتك
+                          {elapsedSec === 0
+                            ? mode === "face"
+                              ? "بانتظار ظهور وجهك داخل الإطار لبدء العد التلقائي"
+                              : "بانتظار وضع إصبعك على العدسة لبدء القياس"
+                            : "تم إيقاف المؤقت والبيانات مؤقتاً لحين عودتك"}
                         </p>
                         <p className="text-[11px] text-slate-200 mt-0.5">
                           {getZoneGuidanceText(zoneGuidance, mode)}
@@ -2533,6 +2645,8 @@ export default function App() {
                       respFreqHz={metrics.respFreqHz}
                       respSnrDb={metrics.respSnrDb}
                       bufferSeconds={metrics.bufferSeconds}
+                      respStatus={metrics.respStatus}
+                      breathHoldSeconds={metrics.breathHoldSeconds}
                     />
                   </div>
                 )}

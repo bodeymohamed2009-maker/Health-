@@ -51,19 +51,28 @@ export function MetricInspectorDrawer({
         };
       }
       case "resp": {
+        const isHold = metrics.respStatus === "breath_hold";
         const val = metrics.respirationBrpm;
-        const pct =
-          val !== null ? Math.max(0, Math.min(100, ((val - 6) / (28 - 6)) * 100)) : null;
+        const pct = isHold
+          ? 0
+          : val !== null
+          ? Math.max(0, Math.min(100, ((val - 6) / (28 - 6)) * 100))
+          : null;
         return {
           icon: <Wind className="w-4 h-4 text-teal-700 dark:text-teal-300" />,
-          title: "تحليل معدل التنفس (RIAV + RIIV + RIFV)",
-          subtitle:
-            val !== null
-              ? `معدل التنفس الطبيعي أثناء الراحة يتراوح بين 12 و20 دورة/دقيقة. قراءتك الحالية ${val} BrPM بجودة طيف ${metrics.respSnrDb.toFixed(1)} dB.`
-              : "يتطلب استخلاص موجة التنفس 12 ثانية من البيانات المستقرة عبر قياس تعديل سعة النبض واضطراب النظم الجيبي.",
-          rangeLabel: "6–28 BrPM (الطبيعي 12–20)",
+          title: isHold
+            ? "رصد توقف التنفس مؤقتاً (كتم النفس)"
+            : "تحليل معدل التنفس (RIAV + RIIV + RIFV)",
+          subtitle: isHold
+            ? `انخفض التضمين التنفسي في موجة النبض واضطراب النظم الجيبي لمدة ${(metrics.breathHoldSeconds ?? 5).toFixed(1)} ثوانٍ، مما يشير إلى كتم النفس. تنفّس بهدوء لاستئناف القراءة.`
+            : val !== null
+            ? `معدل التنفس الطبيعي أثناء الراحة يتراوح بين 12 و20 دورة/دقيقة. قراءتك الحالية ${val} BrPM بجودة طيف ${metrics.respSnrDb.toFixed(1)} dB.`
+            : "يتطلب استخلاص موجة التنفس 12 ثانية من البيانات المستقرة عبر قياس تعديل سعة النبض واضطراب النظم الجيبي.",
+          rangeLabel: isHold ? "Breath Hold Detected" : "6–28 BrPM (الطبيعي 12–20)",
           markerPct: pct,
-          barColor: "bg-teal-700 dark:bg-teal-400",
+          barColor: isHold
+            ? "bg-amber-600 dark:bg-amber-400"
+            : "bg-teal-700 dark:bg-teal-400",
           actionLabel: "تشغيل موجّه التنفس 0.1 Hz",
           onAction: onOpenPacer,
         };

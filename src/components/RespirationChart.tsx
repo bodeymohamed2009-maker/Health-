@@ -1,4 +1,5 @@
 import { useState } from "react";
+import type { RespStatus } from "../types/rppg";
 
 interface RespirationChartProps {
   respWaveform: number[];
@@ -7,6 +8,8 @@ interface RespirationChartProps {
   respFreqHz: number | null;
   respSnrDb: number;
   bufferSeconds: number;
+  respStatus?: RespStatus;
+  breathHoldSeconds?: number;
 }
 
 export function RespirationChart({
@@ -16,6 +19,8 @@ export function RespirationChart({
   respFreqHz,
   respSnrDb,
   bufferSeconds,
+  respStatus,
+  breathHoldSeconds = 0,
 }: RespirationChartProps) {
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
 
@@ -27,6 +32,7 @@ export function RespirationChart({
   const plotH = height - padY * 2;
 
   const hasData = respWaveform.length >= 6;
+  const isBreathHold = respStatus === "breath_hold";
 
   const coords = hasData
     ? respWaveform.map((val, i) => {
@@ -53,16 +59,24 @@ export function RespirationChart({
             موجة التنفس المدمجة (RIAV + RIIV + RIFV)
           </h3>
           <p className="text-xs text-slate-600 dark:text-slate-400 mt-0.5">
-            تضمين سعة النبض وخط الأساس واضطراب النظم الجيبي (0.12–0.55 Hz)
+            {isBreathHold
+              ? "رصد توقف مؤقت للتنفس (كتم النفس) — هبوط التضمين التنفسي عن خط الأساس"
+              : "تضمين سعة النبض وخط الأساس واضطراب النظم الجيبي (0.12–0.55 Hz)"}
           </p>
         </div>
 
         <div
           dir="ltr"
-          className="text-xs font-mono tabular-nums text-teal-700 dark:text-teal-300 shrink-0 pt-0.5 font-semibold"
+          className={`text-xs font-mono tabular-nums shrink-0 pt-0.5 font-semibold ${
+            isBreathHold
+              ? "text-amber-800 dark:text-amber-300"
+              : "text-teal-700 dark:text-teal-300"
+          }`}
         >
           {hoveredCoord !== null
             ? `mod ${hoveredCoord.val >= 0 ? "+" : ""}${hoveredCoord.val.toFixed(2)}σ`
+            : isBreathHold
+            ? `BREATH HOLD · ${breathHoldSeconds.toFixed(1)}s`
             : respirationBrpm !== null && respFreqHz !== null
             ? `${respirationBrpm} BrPM · SNR ${respSnrDb.toFixed(1)} dB`
             : `${Math.min(12, bufferSeconds).toFixed(1)} / 12.0s`}
@@ -92,7 +106,11 @@ export function RespirationChart({
               y1="0"
               x2="0"
               y2="1"
-              className="text-teal-700 dark:text-teal-500"
+              className={
+                isBreathHold
+                  ? "text-amber-700 dark:text-amber-400"
+                  : "text-teal-700 dark:text-teal-500"
+              }
             >
               <stop offset="0%" stopColor="currentColor" stopOpacity="0.22" />
               <stop offset="100%" stopColor="currentColor" stopOpacity="0" />
@@ -118,7 +136,11 @@ export function RespirationChart({
               <polygon fill="url(#respFillGrad)" points={areaPoints} />
               <polyline
                 fill="none"
-                className="stroke-teal-700 dark:stroke-teal-400"
+                className={
+                  isBreathHold
+                    ? "stroke-amber-700 dark:stroke-amber-400"
+                    : "stroke-teal-700 dark:stroke-teal-400"
+                }
                 strokeWidth="2.1"
                 strokeLinejoin="round"
                 strokeLinecap="round"
