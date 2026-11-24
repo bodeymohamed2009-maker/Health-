@@ -62,8 +62,276 @@ function isFacialSkinPixel(r: number, g: number, b: number): boolean {
   return ycbcrSkin && (rgbSkin || (Cr >= 134 && Cr <= 174 && Cb >= 77 && Cb <= 127));
 }
 
+/**
+ * 2-Axis Velocity-Aware Kalman Face Tracker with Secondary Stabilization.
+ * Tracks [cx, vx], [cy, vy], plus adaptive bounding radii and head tilt.
+ */
+export class KalmanFaceTracker {
+  private cx = 0.5;
+  private cy = 0.46;
+  private vx = 0;
+  private vy = 0;
+  private rx = 0.2;
+  private ry = 0.32;
+  private tiltDeg = 0;
+  private initialized = false;
+  private lastTs = 0;
+
+  // 2x2 covariance matrices for X and Y axes
+  private px00 = 0.02;
+  private px01 = 0;
+  private px10 = 0;
+  private px11 = 0.05;
+  private py00 = 0.02;
+  private py01 = 0;
+  private py10 = 0;
+  private py11 = 0.05;
+
+  public reset(): void {
+    this.cx = 0.5;
+    this.cy = 0.46;
+    this.vx = 0;
+    this.vy = 0;
+    this.rx = 0.2;
+    this.ry = 0.32;
+    this.tiltDeg = 0;
+    this.initialized = false;
+    this.lastTs = 0;
+    this.px00 = 0.02;
+    this.px01 = 0;
+    this.px10 = 0;
+    this.px11 = 0.05;
+    this.py00 = 0.02;
+    this.py01 = 0;
+    this.py10 = 0;
+    this.py11 = 0.05;
+  }
+
+  public isInitialized(): boolean {
+    return this.initialized;
+  }
+
+  public getState(): FaceBox {
+    return {
+      cx: this.cx,
+      cy: this.cy,
+      rx: this.rx,
+      ry: this.ry,
+      headTiltDeg: this.tiltDeg,
+    };
+  }
+
+  public predict(nowMs: number): FaceBox {
+    if (!this.initialized) {
+      return this.getState();
+    }
+    const rawDt = this.lastTs > 0 ? (nowMs - this.lastTs) / 1000 : 0.033;
+    const dt = Math.max(0.01, Math.min(0.12, rawDt));
+    this.lastTs = nowMs;
+
+    // Velocity damping prevents runaway coasting during occlusion
+    const damp = 0.85;
+    this.cx = Math.max(0.04, Math.min(0.96, this.cx + this.vx * dt));
+    this.cy = Math.max(0.04, Math.min(0.96, this.cy + this.vy * dt));
+    this.vx *= damp;
+    this.vy *= damp;
+
+    const qPos = 0.00045;
+    const qVel = 0.004;
+
+    const nx00 = this.px00 + dt * (this.px10 + this.px01) + dt * dt * this.px11 + qPos;
+    const nx01 = damp * (this.px01 + dt * this.px11);
+    const nx10 = damp * (this.px10 + dt * this.px11);
+    const nx11 = damp * damp * this.px11 + qVel;
+    this.px00 = nx00;
+    this.px01 = nx01;
+    this.px10 = nx10;
+    this.px11 = nx11;
+
+    const ny00 = this.py00 + dt * (this.py10 + this.py01) + dt * dt * this.py11 + qPos;
+    const ny01 = damp * (this.py01 + dt * this.py11);
+    const ny10 = damp * (this.py10 + dt * this.py11);
+    const ny11 = damp * damp * this.py11 + qVel;
+    this.py00 = ny00;
+    this.py01 = ny01;
+    this.py10 = ny10;
+    this.py11 = ny11;
+
+    return this.getState();
+  }
+
+  public evaluateGate(obsCx: number, obsCy: number, obsRx: number): {
+    inGate: boolean;
+    innovation: number;
+    gateRadius: number;
+  } {
+    const innovation = Math.hypot(obsCx - this.cx, obsCy - this.cy);
+    const gateRadius = Math.max(0.19, this.rx * 1.35);
+    const sizeRatio = obsRx / Math.max(0.07, this.rx);
+    return {
+      inGate: innovation <= gateRadius && sizeRatio >= 0.55 && sizeRatio <= 1.8,
+      innovation,
+      gateRadius,
+    };
+  }
+
+  private kalmanUpdateAxis(
+    pos: number,
+    vel: number,
+    p00: number,
+    p01: number,
+    p10: number,
+    p11: number,
+    obs: number,
+    rMeas: number
+  ): { pos: number; vel: number; p00: number; p01: number; p10: number; p11: number } {
+    const innov = obs - pos;
+    const s = p00 + rMeas;
+    const k0 = p00 / s;
+    const k1 = p10 / s;
+    const nextPos = Math.max(0.04, Math.min(0.96, pos + k0 * innov));
+    const nextVel = Math.max(-1.2, Math.min(1.2, vel + k1 * innov));
+    return {
+      pos: nextPos,
+      vel: nextVel,
+      p00: (1 - k0) * p00,
+      p01: (1 - k0) * p01,
+      p10: p10 - k1 * p00,
+      p11: p11 - k1 * p01,
+    };
+  }
+
+  public updatePrimary(
+    obsCx: number,
+    obsCy: number,
+    obsRx: number,
+    obsRy: number,
+    nowMs: number,
+    fastSnap = false
+  ): FaceBox {
+    if (!this.initialized || fastSnap) {
+      this.cx = obsCx;
+      this.cy = obsCy;
+      this.vx = 0;
+      this.vy = 0;
+      this.rx = obsRx;
+      this.ry = obsRy;
+      this.initialized = true;
+      this.lastTs = nowMs;
+      this.px00 = 0.008;
+      this.py00 = 0.008;
+      return this.getState();
+    }
+
+    const shift = Math.hypot(obsCx - this.cx, obsCy - this.cy);
+    const rMeas = shift > 0.12 ? 0.00018 : shift > 0.035 ? 0.00065 : 0.0024;
+    const ux = this.kalmanUpdateAxis(
+      this.cx,
+      this.vx,
+      this.px00,
+      this.px01,
+      this.px10,
+      this.px11,
+      obsCx,
+      rMeas
+    );
+    this.cx = ux.pos;
+    this.vx = ux.vel;
+    this.px00 = ux.p00;
+    this.px01 = ux.p01;
+    this.px10 = ux.p10;
+    this.px11 = ux.p11;
+
+    const uy = this.kalmanUpdateAxis(
+      this.cy,
+      this.vy,
+      this.py00,
+      this.py01,
+      this.py10,
+      this.py11,
+      obsCy,
+      rMeas
+    );
+    this.cy = uy.pos;
+    this.vy = uy.vel;
+    this.py00 = uy.p00;
+    this.py01 = uy.p01;
+    this.py10 = uy.p10;
+    this.py11 = uy.p11;
+
+    const sizeAlpha = shift > 0.05 ? 0.28 : 0.12;
+    this.rx = this.rx * (1 - sizeAlpha) + obsRx * sizeAlpha;
+    this.ry = this.ry * (1 - sizeAlpha) + obsRy * sizeAlpha;
+    this.lastTs = nowMs;
+    return this.getState();
+  }
+
+  /**
+   * Secondary stabilization update when head tilts or user glances momentarily sideways:
+   * uses elevated measurement noise R so asymmetric half-face centroids don't yank ROI boxes,
+   * and preserves locked face dimensions.
+   */
+  public updateSecondary(obsCx: number, obsCy: number, nowMs: number): FaceBox {
+    if (!this.initialized) {
+      return this.getState();
+    }
+    const rSecondary = 0.0045;
+    const ux = this.kalmanUpdateAxis(
+      this.cx,
+      this.vx * 0.7,
+      this.px00,
+      this.px01,
+      this.px10,
+      this.px11,
+      obsCx,
+      rSecondary
+    );
+    this.cx = ux.pos;
+    this.vx = ux.vel * 0.75;
+    this.px00 = ux.p00;
+    this.px01 = ux.p01;
+    this.px10 = ux.p10;
+    this.px11 = ux.p11;
+
+    const uy = this.kalmanUpdateAxis(
+      this.cy,
+      this.vy * 0.7,
+      this.py00,
+      this.py01,
+      this.py10,
+      this.py11,
+      obsCy,
+      rSecondary
+    );
+    this.cy = uy.pos;
+    this.vy = uy.vel * 0.75;
+    this.py00 = uy.p00;
+    this.py01 = uy.p01;
+    this.py10 = uy.p10;
+    this.py11 = uy.p11;
+    this.lastTs = nowMs;
+    return this.getState();
+  }
+
+  public updateTilt(targetTiltDeg: number): number {
+    this.tiltDeg = this.tiltDeg * 0.8 + targetTiltDeg * 0.2;
+    return this.tiltDeg;
+  }
+
+  public relaxTowardCenter(alpha = 0.1): void {
+    this.cx = this.cx * (1 - alpha) + 0.5 * alpha;
+    this.cy = this.cy * (1 - alpha) + 0.46 * alpha;
+    this.rx = this.rx * (1 - alpha) + 0.2 * alpha;
+    this.ry = this.ry * (1 - alpha) + 0.32 * alpha;
+    this.vx *= 0.6;
+    this.vy *= 0.6;
+    this.tiltDeg *= 0.85;
+  }
+}
+
 export class RoiFrameExtractor {
   private prevLuma: Float32Array | null = null;
+  private kalmanFace = new KalmanFaceTracker();
   private smoothCx = 0.5;
   private smoothCy = 0.46;
   private smoothRx = 0.2;
@@ -83,6 +351,7 @@ export class RoiFrameExtractor {
   private consecutiveFaceFrames = 0;
   private consecutiveMissFrames = 0;
   private hasLockedFace = false;
+  private lastPrimaryVerifiedTs = 0;
 
   constructor() {
     if (typeof window !== "undefined") {
@@ -106,6 +375,7 @@ export class RoiFrameExtractor {
 
   public reset(): void {
     this.prevLuma = null;
+    this.kalmanFace.reset();
     this.smoothCx = 0.5;
     this.smoothCy = 0.46;
     this.smoothRx = 0.2;
@@ -123,6 +393,7 @@ export class RoiFrameExtractor {
     this.consecutiveFaceFrames = 0;
     this.consecutiveMissFrames = 0;
     this.hasLockedFace = false;
+    this.lastPrimaryVerifiedTs = 0;
   }
 
   /**
@@ -168,8 +439,8 @@ export class RoiFrameExtractor {
             const dy = sortedEyes[1].y - sortedEyes[0].y;
             if (dx > 8) {
               headTiltDeg = Math.max(
-                -20,
-                Math.min(20, (Math.atan2(dy, dx) * 180) / Math.PI)
+                -30,
+                Math.min(30, (Math.atan2(dy, dx) * 180) / Math.PI)
               );
             }
           }
@@ -486,6 +757,14 @@ export class RoiFrameExtractor {
 
     const clusterCandidate = count2 >= minClusterSkinPts && !uniformBackdropSuspect;
 
+    if (this.hasLockedFace && this.kalmanFace.isInitialized()) {
+      this.kalmanFace.predict(nowTs);
+    }
+
+    let inKalmanGate = false;
+    let candidateCx = this.smoothCx;
+    let candidateCy = this.smoothCy;
+
     if (clusterCandidate) {
       const meanX = sumX2 / count2;
       const meanY = sumY2 / count2;
@@ -507,30 +786,57 @@ export class RoiFrameExtractor {
         targetRy = nb.ry * 0.74 + targetRy * 0.26;
       }
 
+      candidateCx = targetCx;
+      candidateCy = targetCy;
+
+      const gate = this.kalmanFace.evaluateGate(targetCx, targetCy, targetRx);
+      inKalmanGate = !this.hasLockedFace || gate.inGate || hasFreshNativeHint;
+
       const shift = Math.hypot(targetCx - this.smoothCx, targetCy - this.smoothCy);
-      // Fast snap on initial lock or large head jumps, deadband hysteresis when steady
-      const alpha = !this.hasLockedFace
-        ? 0.92
-        : shift > 0.15
-        ? 0.84
-        : shift > 0.08
-        ? 0.62
-        : shift > 0.03
-        ? 0.36
-        : shift > 0.008
-        ? 0.18
-        : 0.07;
-      const sizeAlpha = !this.hasLockedFace ? 0.6 : shift > 0.05 ? 0.28 : 0.12;
-      this.smoothCx = this.smoothCx * (1 - alpha) + targetCx * alpha;
-      this.smoothCy = this.smoothCy * (1 - alpha) + targetCy * alpha;
-      this.smoothRx = this.smoothRx * (1 - sizeAlpha) + targetRx * sizeAlpha;
-      this.smoothRy = this.smoothRy * (1 - sizeAlpha) + targetRy * sizeAlpha;
+      if (hasFreshNativeHint || !this.hasLockedFace || !nativeConfirmedNoFace) {
+        const kf = this.kalmanFace.updatePrimary(
+          targetCx,
+          targetCy,
+          targetRx,
+          targetRy,
+          nowTs,
+          !this.hasLockedFace || shift > 0.16
+        );
+        this.smoothCx = kf.cx;
+        this.smoothCy = kf.cy;
+        this.smoothRx = kf.rx;
+        this.smoothRy = kf.ry;
+      } else if (inKalmanGate) {
+        // Secondary Kalman stabilization update prevents centroid pull when tilting/turning
+        const kf = this.kalmanFace.updateSecondary(targetCx, targetCy, nowTs);
+        this.smoothCx = kf.cx;
+        this.smoothCy = kf.cy;
+        this.smoothRx = kf.rx;
+        this.smoothRy = kf.ry;
+      }
     } else if (hasFreshNativeHint) {
       const nb = this.nativeHint!.box;
-      this.smoothCx = this.smoothCx * 0.5 + nb.cx * 0.5;
-      this.smoothCy = this.smoothCy * 0.5 + nb.cy * 0.5;
-      this.smoothRx = this.smoothRx * 0.72 + nb.rx * 0.28;
-      this.smoothRy = this.smoothRy * 0.72 + nb.ry * 0.28;
+      inKalmanGate = true;
+      candidateCx = nb.cx;
+      candidateCy = nb.cy;
+      const kf = this.kalmanFace.updatePrimary(
+        nb.cx,
+        nb.cy,
+        nb.rx,
+        nb.ry,
+        nowTs,
+        !this.hasLockedFace
+      );
+      this.smoothCx = kf.cx;
+      this.smoothCy = kf.cy;
+      this.smoothRx = kf.rx;
+      this.smoothRy = kf.ry;
+    } else if (this.hasLockedFace && this.kalmanFace.isInitialized()) {
+      const kf = this.kalmanFace.getState();
+      this.smoothCx = kf.cx;
+      this.smoothCy = kf.cy;
+      this.smoothRx = kf.rx;
+      this.smoothRy = kf.ry;
     }
 
     const cx = this.smoothCx;
@@ -539,15 +845,25 @@ export class RoiFrameExtractor {
     const ry = this.smoothRy;
     const clamp01 = (v: number) => Math.max(0.01, Math.min(0.99, v));
 
-    // Ocular luminance-valley detector + structural facial symmetry check
-    let targetTiltDeg = this.nativeHint?.box.headTiltDeg ?? 0;
+    // Ocular luminance-valley detector + tilt-aware structural facial symmetry check
+    let targetTiltDeg = this.nativeHint?.box.headTiltDeg ?? this.smoothTiltDeg * 0.9;
     let bilateralOcularStructure = false;
+    let unilateralOcularStructure = false;
+    const prevTiltRad = (this.smoothTiltDeg * Math.PI) / 180;
+    const tiltMarginY = Math.min(0.28, Math.abs(Math.sin(prevTiltRad)) * 0.45);
 
-    const findEyeValley = (xStartN: number, xEndN: number) => {
+    const findEyeValley = (xStartN: number, xEndN: number, sideOffset: number) => {
       const px0 = Math.max(2, Math.floor(clamp01(xStartN) * width));
       const px1 = Math.min(width - 3, Math.floor(clamp01(xEndN) * width));
-      const py0 = Math.max(2, Math.floor(clamp01(cy - 0.36 * ry) * height));
-      const py1 = Math.min(height - 3, Math.floor(clamp01(cy + 0.06 * ry) * height));
+      const tiltShiftY = sideOffset * Math.sin(prevTiltRad) * 0.65;
+      const py0 = Math.max(
+        2,
+        Math.floor(clamp01(cy + tiltShiftY - (0.38 + tiltMarginY) * ry) * height)
+      );
+      const py1 = Math.min(
+        height - 3,
+        Math.floor(clamp01(cy + tiltShiftY + (0.08 + tiltMarginY) * ry) * height)
+      );
       let minAvg = 999;
       let maxAvg = 0;
       let bestX = (px0 + px1) * 0.5;
@@ -581,15 +897,15 @@ export class RoiFrameExtractor {
     };
 
     if (clusterCandidate || hasFreshNativeHint) {
-      const leftEye = findEyeValley(cx - 0.62 * rx, cx - 0.12 * rx);
-      const rightEye = findEyeValley(cx + 0.12 * rx, cx + 0.62 * rx);
+      const leftEye = findEyeValley(cx - 0.64 * rx, cx - 0.1 * rx, -0.35 * rx);
+      const rightEye = findEyeValley(cx + 0.1 * rx, cx + 0.64 * rx, 0.35 * rx);
       const eyeSeparationX = rightEye.x - leftEye.x;
       const eyeDiffY = Math.abs(leftEye.y - rightEye.y);
 
       const fhX0 = Math.max(1, Math.floor(clamp01(cx - 0.3 * rx) * width));
       const fhX1 = Math.min(width - 2, Math.floor(clamp01(cx + 0.3 * rx) * width));
-      const fhY0 = Math.max(1, Math.floor(clamp01(cy - 0.62 * ry) * height));
-      const fhY1 = Math.min(height - 2, Math.floor(clamp01(cy - 0.42 * ry) * height));
+      const fhY0 = Math.max(1, Math.floor(clamp01(cy - 0.64 * ry) * height));
+      const fhY1 = Math.min(height - 2, Math.floor(clamp01(cy - 0.4 * ry) * height));
       let fhSum = 0;
       let fhCnt = 0;
       for (let y = fhY0; y <= fhY1; y += 2) {
@@ -601,13 +917,21 @@ export class RoiFrameExtractor {
       }
       const foreheadLuma = fhCnt > 0 ? fhSum / fhCnt : 0;
 
+      const leftStrong =
+        leftEye.contrast >= 11 && foreheadLuma >= leftEye.minAvg + 3;
+      const rightStrong =
+        rightEye.contrast >= 11 && foreheadLuma >= rightEye.minAvg + 3;
+      if (leftStrong || rightStrong) {
+        unilateralOcularStructure = true;
+      }
+
       if (
         leftEye.contrast >= 12 &&
         rightEye.contrast >= 12 &&
         foreheadLuma >= leftEye.minAvg + 4 &&
         foreheadLuma >= rightEye.minAvg + 4 &&
-        eyeSeparationX >= Math.max(0.035, 0.28 * rx) &&
-        eyeDiffY <= Math.max(0.055, 0.26 * ry)
+        eyeSeparationX >= Math.max(0.032, 0.25 * rx) &&
+        eyeDiffY <= Math.max(0.068, 0.42 * ry)
       ) {
         bilateralOcularStructure = true;
         if (!hasFreshNativeHint || this.nativeHint?.box.headTiltDeg === undefined) {
@@ -615,7 +939,7 @@ export class RoiFrameExtractor {
           const dy = (rightEye.y - leftEye.y) * height;
           if (dx > 10) {
             const deg = (Math.atan2(dy, dx) * 180) / Math.PI;
-            if (Math.abs(deg) <= 20) {
+            if (Math.abs(deg) <= 30) {
               targetTiltDeg = deg;
             }
           }
@@ -623,7 +947,7 @@ export class RoiFrameExtractor {
       }
     }
 
-    this.smoothTiltDeg = this.smoothTiltDeg * 0.82 + targetTiltDeg * 0.18;
+    this.smoothTiltDeg = this.kalmanFace.updateTilt(targetTiltDeg);
     const tiltRad = (this.smoothTiltDeg * Math.PI) / 180;
     const cosT = Math.cos(tiltRad);
     const sinT = Math.sin(tiltRad);
@@ -835,8 +1159,8 @@ export class RoiFrameExtractor {
       (regionResults.leftCheek.valid ? 1 : 0) +
       (regionResults.rightCheek.valid ? 1 : 0);
 
-    // Confirm real human face via Chromium FaceDetector OR bilateral eye-valley + multi-ROI skin geometry
-    const rawFaceVerified =
+    // Primary verification: required to establish initial lock (strictly rejects walls/backgrounds)
+    const primaryVerified =
       hasFreshNativeHint ||
       (!nativeConfirmedNoFace &&
         clusterCandidate &&
@@ -844,12 +1168,41 @@ export class RoiFrameExtractor {
         validRegionCount >= 2 &&
         skinCoveragePct >= 28);
 
-    if (rawFaceVerified) {
+    // Secondary Kalman stabilization check (active ONLY when face lock was previously established):
+    // prevents premature 'no_face' when user tilts head (>15°) or momentarily looks away
+    const timeSincePrimaryMs =
+      this.lastPrimaryVerifiedTs > 0 ? nowTs - this.lastPrimaryVerifiedTs : Infinity;
+    const secondarySkinSupported =
+      clusterCandidate &&
+      inKalmanGate &&
+      validRegionCount >= 1 &&
+      skinCoveragePct >= 14 &&
+      (unilateralOcularStructure || validRegionCount >= 2) &&
+      timeSincePrimaryMs <= 2400;
+    const secondaryMomentumCoast =
+      totalSkinCount >= 18 &&
+      (inKalmanGate || this.kalmanFace.evaluateGate(candidateCx, candidateCy, rx).inGate) &&
+      timeSincePrimaryMs <= 700;
+    const secondaryTurnBlinkGrace =
+      !uniformBackdropSuspect &&
+      centerRawLuma >= 38 &&
+      timeSincePrimaryMs <= 450;
+
+    const secondaryStabilized =
+      this.hasLockedFace &&
+      !primaryVerified &&
+      (secondarySkinSupported || secondaryMomentumCoast || secondaryTurnBlinkGrace);
+
+    if (primaryVerified) {
       this.consecutiveFaceFrames++;
       this.consecutiveMissFrames = 0;
+      this.lastPrimaryVerifiedTs = nowTs;
       if (this.consecutiveFaceFrames >= 2) {
         this.hasLockedFace = true;
       }
+    } else if (secondaryStabilized) {
+      this.consecutiveFaceFrames = Math.max(1, this.consecutiveFaceFrames);
+      this.consecutiveMissFrames = 0;
     } else {
       this.consecutiveFaceFrames = 0;
       this.consecutiveMissFrames++;
@@ -858,14 +1211,16 @@ export class RoiFrameExtractor {
       }
       // Gently return tracking reticle toward center after prolonged absence
       if (this.consecutiveMissFrames > 12) {
-        this.smoothCx = this.smoothCx * 0.9 + 0.5 * 0.1;
-        this.smoothCy = this.smoothCy * 0.9 + 0.46 * 0.1;
-        this.smoothRx = this.smoothRx * 0.9 + 0.2 * 0.1;
-        this.smoothRy = this.smoothRy * 0.9 + 0.32 * 0.1;
+        this.kalmanFace.relaxTowardCenter(0.1);
+        const kf = this.kalmanFace.getState();
+        this.smoothCx = kf.cx;
+        this.smoothCy = kf.cy;
+        this.smoothRx = kf.rx;
+        this.smoothRy = kf.ry;
       }
     }
 
-    const faceDetected = rawFaceVerified || this.hasLockedFace;
+    const faceDetected = primaryVerified || secondaryStabilized || this.hasLockedFace;
     const isNearEdge =
       cx - rx * 0.9 < 0.025 ||
       cx + rx * 0.9 > 0.975 ||
@@ -887,9 +1242,8 @@ export class RoiFrameExtractor {
       zoneGuidance = "off_center";
     } else if (
       !faceDetected ||
-      totalSkinCount < 40 ||
-      skinCoveragePct < 24 ||
-      validRegionCount < 2
+      (!secondaryStabilized &&
+        (totalSkinCount < 40 || skinCoveragePct < 24 || validRegionCount < 2))
     ) {
       zoneGuidance = "no_face";
     } else if (rx < 0.105 && !hasFreshNativeHint) {
@@ -935,7 +1289,7 @@ export class RoiFrameExtractor {
       headTiltDeg: Number(this.smoothTiltDeg.toFixed(1)),
     };
 
-    if (!faceDetected || totalSkinCount < 40 || !inZone) {
+    if (!faceDetected || !inZone || (totalSkinCount < 28 && !secondaryStabilized)) {
       return {
         r: 0,
         g: 0,
@@ -958,10 +1312,15 @@ export class RoiFrameExtractor {
       };
     }
 
+    const hasUsableSkinSample =
+      totalSkinCount >= 28 &&
+      validRegionCount >= (secondaryStabilized ? 1 : 2) &&
+      skinCoveragePct >= (secondaryStabilized ? 14 : 24);
+
     return {
-      r: totalSumR / totalSkinCount,
-      g: totalSumG / totalSkinCount,
-      b: totalSumB / totalSkinCount,
+      r: hasUsableSkinSample ? totalSumR / totalSkinCount : 0,
+      g: hasUsableSkinSample ? totalSumG / totalSkinCount : 0,
+      b: hasUsableSkinSample ? totalSumB / totalSkinCount : 0,
       bgR,
       bgG,
       bgB,
@@ -974,7 +1333,7 @@ export class RoiFrameExtractor {
       inZone,
       zoneGuidance,
       roiBoxes,
-      hasValidTarget: inZone && skinCoveragePct >= 24 && validRegionCount >= 2,
+      hasValidTarget: inZone && hasUsableSkinSample,
       awb: awbState,
       regions: regionResults,
     };

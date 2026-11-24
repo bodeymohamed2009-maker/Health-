@@ -683,7 +683,7 @@ export default function App() {
           frameInZone = roi.inZone;
 
           // Auto-Pause / Seamless Resume Zone State Machine
-          if (roi.inZone && roi.hasValidTarget) {
+          if (roi.inZone && (!isPausedRef.current || roi.hasValidTarget)) {
             outOfZoneSinceRef.current = null;
             if (isPausedRef.current) {
               inZoneSinceRef.current ??= now;
