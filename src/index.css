@@ -1,0 +1,92 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --font-sans: "IBM Plex Sans Arabic", "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "IBM Plex Sans Arabic", "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
+@layer base {
+  html {
+    font-family: var(--font-sans);
+    background-color: #f8fafc;
+    color: #0f172a;
+    scroll-behavior: smooth;
+    -webkit-font-smoothing: antialiased;
+    color-scheme: light;
+  }
+
+  html.dark {
+    background-color: #060911;
+    color: #e2e8f0;
+    color-scheme: dark;
+  }
+
+  ::selection {
+    background-color: rgba(14, 116, 144, 0.2);
+    color: #083344;
+  }
+
+  html.dark ::selection {
+    background-color: rgba(34, 211, 238, 0.25);
+    color: #ecfeff;
+  }
+
+  button:focus-visible,
+  a:focus-visible,
+  input:focus-visible {
+    outline: 2px solid #0e7490;
+    outline-offset: 2px;
+  }
+
+  html.dark button:focus-visible,
+  html.dark a:focus-visible,
+  html.dark input:focus-visible {
+    outline: 2px solid #22d3ee;
+    outline-offset: 2px;
+  }
+}
+
+@keyframes optical-scan-sweep {
+  0% {
+    transform: translateY(-100%);
+    opacity: 0;
+  }
+  15% {
+    opacity: 0.7;
+  }
+  85% {
+    opacity: 0.7;
+  }
+  100% {
+    transform: translateY(380px);
+    opacity: 0;
+  }
+}
+
+.animate-optical-sweep {
+  animation: optical-scan-sweep 3.2s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+  will-change: transform, opacity;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+@media print {
+  body {
+    background: #ffffff !important;
+    color: #0f172a !important;
+  }
+  .no-print {
+    display: none !important;
+  }
+}
