@@ -13,7 +13,7 @@ import type {
 const TARGET_FS = 30;
 const RESP_FS = 4;
 const MIN_SECONDS_FOR_ESTIMATE = 5.0;
-const MIN_SECONDS_FOR_RESPIRATION = 12.0;
+const MIN_SECONDS_FOR_RESPIRATION = 10.0;
 const MAX_CARDIAC_WINDOW_SECONDS = 12.0;
 const MAX_RESP_WINDOW_SECONDS = 30.0;
 
@@ -116,6 +116,201 @@ export class KalmanBpmTracker {
     this.p = (1 - K) * this.p;
 
     return Math.round(this.x);
+  }
+}
+
+/**
+ * Stateful 1D Kalman Respiration & Adaptive Breath-Hold Hysteresis Tracker.
+ * Combines a velocity-damped Kalman filter for steady BrPM (6..34 BrPM) with an
+ * asymmetric personal baseline and Schmitt-trigger state machine to eliminate
+ * breath-hold flickering on noisy webcams.
+ */
+export class RespirationTracker {
+  private brpm: number | null = null;
+  private brpmVel = 0;
+  private brpmCov = 64;
+  private recentBrpm: number[] = [];
+
+  private baselineEnv = 0;
+  private baselineCardiacEnv = 0;
+  private inBreathHold = false;
+  private holdEnterStreak = 0;
+  private holdExitStreak = 0;
+  private holdStartMs = 0;
+
+  public reset(): void {
+    this.brpm = null;
+    this.brpmVel = 0;
+    this.brpmCov = 64;
+    this.recentBrpm = [];
+    this.baselineEnv = 0;
+    this.baselineCardiacEnv = 0;
+    this.inBreathHold = false;
+    this.holdEnterStreak = 0;
+    this.holdExitStreak = 0;
+    this.holdStartMs = 0;
+  }
+
+  public getEstimate(): number | null {
+    return this.brpm !== null ? Math.round(this.brpm) : null;
+  }
+
+  public isLocked(): boolean {
+    return this.brpm !== null && this.brpmCov < 5.0;
+  }
+
+  public getLearnedBaseline(): { env: number; cardiacEnv: number } {
+    return { env: this.baselineEnv, cardiacEnv: this.baselineCardiacEnv };
+  }
+
+  public updateHoldState(params: {
+    durationSec: number;
+    nowMs: number;
+    holdScore: number;
+    recentEnv: number;
+    recentCardiacEnv: number;
+    recentSnrDb: number;
+    recentPeriodicity: number;
+    rawHoldSec: number;
+    signalBlocked: boolean;
+  }): { isHold: boolean; holdSeconds: number } {
+    const {
+      durationSec,
+      nowMs,
+      holdScore,
+      recentEnv,
+      recentCardiacEnv,
+      recentSnrDb,
+      recentPeriodicity,
+      rawHoldSec,
+      signalBlocked,
+    } = params;
+
+    if (signalBlocked || durationSec < 7.5) {
+      if (signalBlocked) {
+        this.holdEnterStreak = 0;
+      }
+      return { isHold: false, holdSeconds: 0 };
+    }
+
+    // Learn personal breathing baseline ONLY during verified rhythmic breathing
+    if (!this.inBreathHold && recentPeriodicity >= 0.34 && recentSnrDb >= 0.5 && holdScore < 0.42) {
+      if (this.baselineEnv <= 0) {
+        this.baselineEnv = recentEnv;
+        this.baselineCardiacEnv = recentCardiacEnv;
+      } else {
+        // Asymmetric EMA: adapts faster upward to normal breathing, very slow downward so holds don't corrupt it
+        const alphaEnv = recentEnv >= this.baselineEnv ? 0.16 : 0.025;
+        const alphaCard = recentCardiacEnv >= this.baselineCardiacEnv ? 0.16 : 0.025;
+        this.baselineEnv = this.baselineEnv * (1 - alphaEnv) + recentEnv * alphaEnv;
+        this.baselineCardiacEnv =
+          this.baselineCardiacEnv * (1 - alphaCard) + recentCardiacEnv * alphaCard;
+      }
+    }
+
+    if (!this.inBreathHold) {
+      if (holdScore >= 0.56) {
+        this.holdEnterStreak++;
+      } else {
+        this.holdEnterStreak = Math.max(0, this.holdEnterStreak - 1);
+      }
+
+      if (this.holdEnterStreak >= 2 || holdScore >= 0.76) {
+        this.inBreathHold = true;
+        this.holdExitStreak = 0;
+        this.holdStartMs = nowMs - Math.max(3.5, rawHoldSec) * 1000;
+      }
+    } else {
+      // Hysteresis exit: stay locked in breath_hold until sustained genuine rhythmic breathing & amplitude return
+      const minRecoveredEnv =
+        this.baselineCardiacEnv > 0.35
+          ? Math.max(0.30, this.baselineCardiacEnv * 0.46)
+          : 0.32;
+      const strongBreathingResumed =
+        holdScore < 0.38 &&
+        recentPeriodicity >= 0.34 &&
+        recentSnrDb >= 0.6 &&
+        recentCardiacEnv >= minRecoveredEnv;
+      if (strongBreathingResumed) {
+        this.holdExitStreak++;
+        if (this.holdExitStreak >= 3) {
+          this.inBreathHold = false;
+          this.holdEnterStreak = 0;
+          this.holdExitStreak = 0;
+        }
+      } else {
+        this.holdExitStreak = 0;
+      }
+    }
+
+    if (!this.inBreathHold) {
+      return { isHold: false, holdSeconds: 0 };
+    }
+
+    const elapsedHold = Math.max(
+      rawHoldSec,
+      (nowMs - this.holdStartMs) / 1000
+    );
+    return {
+      isHold: true,
+      holdSeconds: Number(Math.max(3.5, elapsedHold).toFixed(1)),
+    };
+  }
+
+  public updateBrpm(
+    measuredBrpm: number | null,
+    snrDb: number,
+    periodicity: number,
+    isMotionArtifact: boolean,
+    isHold: boolean
+  ): number | null {
+    if (isHold) {
+      return null;
+    }
+    if (measuredBrpm === null || measuredBrpm < 6 || measuredBrpm > 34) {
+      return this.brpm !== null ? Math.round(this.brpm) : null;
+    }
+
+    if (this.brpm === null) {
+      this.brpm = measuredBrpm;
+      this.brpmVel = 0;
+      this.brpmCov = 6;
+      this.recentBrpm = [measuredBrpm];
+      return Math.round(this.brpm);
+    }
+
+    if (isMotionArtifact) {
+      this.brpmCov = Math.min(8, this.brpmCov + 0.15);
+      return Math.round(this.brpm);
+    }
+
+    this.recentBrpm.push(measuredBrpm);
+    if (this.recentBrpm.length > 5) {
+      this.recentBrpm.shift();
+    }
+    const sorted = [...this.recentBrpm].sort((a, b) => a - b);
+    const med = sorted[Math.floor(sorted.length / 2)];
+    const stabilized =
+      this.recentBrpm.length >= 3 ? 0.65 * med + 0.35 * measuredBrpm : measuredBrpm;
+
+    const predicted = this.brpm + this.brpmVel * 0.3;
+    const Q = 0.18;
+    this.brpmCov = Math.min(10, this.brpmCov + Q);
+
+    const quality = Math.max(0.4, Math.min(18, snrDb + periodicity * 6));
+    const R = 10 / Math.pow(quality, 1.15);
+
+    if (Math.abs(stabilized - predicted) > 7 && snrDb < 5.0) {
+      return Math.round(this.brpm);
+    }
+
+    const K = this.brpmCov / (this.brpmCov + R);
+    const innov = stabilized - predicted;
+    this.brpm = Math.max(6, Math.min(34, predicted + K * innov));
+    this.brpmVel = Math.max(-0.8, Math.min(0.8, this.brpmVel * 0.5 + K * innov * 0.25));
+    this.brpmCov = (1 - K) * this.brpmCov;
+
+    return Math.round(this.brpm);
   }
 }
 
@@ -1070,6 +1265,351 @@ function extractIcaSignal(
   return bestSrc;
 }
 
+/**
+ * 3x3 Linear System Solver (Gaussian elimination with partial pivoting)
+ * Used for regularized PBV spatial weight computation: (Q + lambda*I) * w = p_bv.
+ */
+function solveLinear3x3(A: number[][], rhs: [number, number, number]): [number, number, number] {
+  const M = [
+    [A[0][0], A[0][1], A[0][2], rhs[0]],
+    [A[1][0], A[1][1], A[1][2], rhs[1]],
+    [A[2][0], A[2][1], A[2][2], rhs[2]],
+  ];
+
+  for (let col = 0; col < 3; col++) {
+    let pivot = col;
+    let maxAbs = Math.abs(M[col][col]);
+    for (let row = col + 1; row < 3; row++) {
+      if (Math.abs(M[row][col]) > maxAbs) {
+        maxAbs = Math.abs(M[row][col]);
+        pivot = row;
+      }
+    }
+    if (pivot !== col) {
+      const tmp = M[col];
+      M[col] = M[pivot];
+      M[pivot] = tmp;
+    }
+    const diag = Math.abs(M[col][col]) > 1e-10 ? M[col][col] : 1e-10;
+    for (let row = col + 1; row < 3; row++) {
+      const factor = M[row][col] / diag;
+      for (let k = col; k < 4; k++) {
+        M[row][k] -= factor * M[col][k];
+      }
+    }
+  }
+
+  const x2 = M[2][3] / (Math.abs(M[2][2]) > 1e-10 ? M[2][2] : 1e-10);
+  const x1 =
+    (M[1][3] - M[1][2] * x2) / (Math.abs(M[1][1]) > 1e-10 ? M[1][1] : 1e-10);
+  const x0 =
+    (M[0][3] - M[0][1] * x1 - M[0][2] * x2) /
+    (Math.abs(M[0][0]) > 1e-10 ? M[0][0] : 1e-10);
+  return [x0, x1, x2];
+}
+
+/**
+ * OMIT: Orthogonal Matrix Image Transformation (Álvarez Casado & Bordallo López, IEEE JBHI 2023 / pyVHR)
+ * Uses orthonormal QR decomposition seeded on the skin reflectance direction to project out
+ * brightness, quantization steps, and webcam compression artifacts via S = I - q0*q0^T.
+ */
+function extractOmitSignal(
+  r: Float64Array,
+  g: Float64Array,
+  b: Float64Array,
+  fs: number
+): Float64Array {
+  const N = r.length;
+  const out = new Float64Array(N);
+  const weightSum = new Float64Array(N);
+  const winLen = Math.max(24, Math.round(1.6 * fs));
+
+  const processWindow = (start: number, len: number) => {
+    let mr = 0,
+      mg = 0,
+      mb = 0;
+    for (let j = 0; j < len; j++) {
+      mr += r[start + j];
+      mg += g[start + j];
+      mb += b[start + j];
+    }
+    mr = mr / len || 1;
+    mg = mg / len || 1;
+    mb = mb / len || 1;
+
+    // Seed column 0 with mean skin reflectance axis so QR q0 spans common-mode intensity/compression drift
+    const norm0 = Math.hypot(mr, mg, mb) || 1;
+    const q0 = [mr / norm0, mg / norm0, mb / norm0];
+
+    // Orthogonalize arterial green-minus-red/blue chrominance direction [-0.45, 0.85, -0.35]
+    const bvpAxis = [-0.45, 0.85, -0.35];
+    const dot0 =
+      q0[0] * bvpAxis[0] + q0[1] * bvpAxis[1] + q0[2] * bvpAxis[2];
+    const wOrth = [
+      bvpAxis[0] - dot0 * q0[0],
+      bvpAxis[1] - dot0 * q0[1],
+      bvpAxis[2] - dot0 * q0[2],
+    ];
+    const wNorm = Math.hypot(wOrth[0], wOrth[1], wOrth[2]) || 1;
+    wOrth[0] /= wNorm;
+    wOrth[1] /= wNorm;
+    wOrth[2] /= wNorm;
+
+    // Also compute normalized 2nd QR complement q2 = q0 x wOrth to suppress residual 2-axis motion if needed
+    const q2 = [
+      q0[1] * wOrth[2] - q0[2] * wOrth[1],
+      q0[2] * wOrth[0] - q0[0] * wOrth[2],
+      q0[0] * wOrth[1] - q0[1] * wOrth[0],
+    ];
+
+    const s1 = new Float64Array(len);
+    const s2 = new Float64Array(len);
+    for (let j = 0; j < len; j++) {
+      const rn = r[start + j] / mr - 1;
+      const gn = g[start + j] / mg - 1;
+      const bn = b[start + j] / mb - 1;
+      s1[j] = wOrth[0] * rn + wOrth[1] * gn + wOrth[2] * bn;
+      s2[j] = q2[0] * rn + q2[1] * gn + q2[2] * bn;
+    }
+
+    // Orthogonal ratio alpha cancels residual correlated motion along q2
+    const cov12 = meanProduct(s1, s2);
+    const var2 = meanProduct(s2, s2) + 1e-6;
+    const alpha = Math.max(-1.2, Math.min(1.2, cov12 / var2));
+
+    for (let j = 0; j < len; j++) {
+      const w = 0.54 - 0.46 * Math.cos((2 * Math.PI * j) / Math.max(1, len - 1));
+      out[start + j] += w * (s1[j] - alpha * s2[j]);
+      weightSum[start + j] += w;
+    }
+  };
+
+  if (N <= winLen) {
+    processWindow(0, N);
+  } else {
+    const step = Math.max(1, Math.floor(winLen / 4));
+    for (let start = 0; start <= N - winLen; start += step) {
+      processWindow(start, winLen);
+    }
+    if ((N - winLen) % step !== 0) {
+      processWindow(N - winLen, winLen);
+    }
+  }
+
+  for (let i = 0; i < N; i++) {
+    if (weightSum[i] > 1e-6) out[i] /= weightSum[i];
+  }
+  return out;
+}
+
+function meanProduct(a: Float64Array, b: Float64Array): number {
+  let acc = 0;
+  for (let i = 0; i < a.length; i++) acc += a[i] * b[i];
+  return acc / Math.max(1, a.length);
+}
+
+/**
+ * PBV: Blood Volume Pulse Signature (De Haan & Van Leest, Physiol. Meas. 2014 / pyVHR / rPPG-Toolbox)
+ * Solves regularized matched filter (Q + lambda*I) * w = p_bv against arterial blood absorption vector [0.33, 0.77, 0.54].
+ */
+function extractPbvSignal(
+  r: Float64Array,
+  g: Float64Array,
+  b: Float64Array,
+  fs: number
+): Float64Array {
+  const N = r.length;
+  const out = new Float64Array(N);
+  const weightSum = new Float64Array(N);
+  const winLen = Math.max(24, Math.round(1.6 * fs));
+  const pbvVec: [number, number, number] = [0.33, 0.77, 0.54];
+
+  const processWindow = (start: number, len: number) => {
+    let mr = 0,
+      mg = 0,
+      mb = 0;
+    for (let j = 0; j < len; j++) {
+      mr += r[start + j];
+      mg += g[start + j];
+      mb += b[start + j];
+    }
+    mr = mr / len || 1;
+    mg = mg / len || 1;
+    mb = mb / len || 1;
+
+    const rn = new Float64Array(len);
+    const gn = new Float64Array(len);
+    const bn = new Float64Array(len);
+    for (let j = 0; j < len; j++) {
+      rn[j] = r[start + j] / mr - 1;
+      gn[j] = g[start + j] / mg - 1;
+      bn[j] = b[start + j] / mb - 1;
+    }
+
+    const chans = [rn, gn, bn];
+    const Q = [
+      [0, 0, 0],
+      [0, 0, 0],
+      [0, 0, 0],
+    ];
+    for (let i = 0; i < 3; i++) {
+      for (let j = i; j < 3; j++) {
+        const val = meanProduct(chans[i], chans[j]);
+        Q[i][j] = val;
+        Q[j][i] = val;
+      }
+    }
+
+    const traceMean = (Q[0][0] + Q[1][1] + Q[2][2]) / 3;
+    const reg = Math.max(1e-7, 0.025 * traceMean);
+    Q[0][0] += reg;
+    Q[1][1] += reg;
+    Q[2][2] += reg;
+
+    const wVec = solveLinear3x3(Q, pbvVec);
+    const wNorm = Math.hypot(wVec[0], wVec[1], wVec[2]) || 1;
+    const w0 = wVec[0] / wNorm;
+    const w1 = wVec[1] / wNorm;
+    const w2 = wVec[2] / wNorm;
+
+    const seg = new Float64Array(len);
+    for (let j = 0; j < len; j++) {
+      seg[j] = w0 * rn[j] + w1 * gn[j] + w2 * bn[j];
+    }
+    const segStd = stdDev(seg) || 1;
+    for (let j = 0; j < len; j++) {
+      const w = 0.5 * (1 - Math.cos((2 * Math.PI * j) / Math.max(1, len - 1)));
+      const hw = Math.max(0.05, w);
+      out[start + j] += hw * (seg[j] / segStd);
+      weightSum[start + j] += hw;
+    }
+  };
+
+  if (N <= winLen) {
+    processWindow(0, N);
+  } else {
+    const step = Math.max(1, Math.floor(winLen / 4));
+    for (let start = 0; start <= N - winLen; start += step) {
+      processWindow(start, winLen);
+    }
+    if ((N - winLen) % step !== 0) {
+      processWindow(N - winLen, winLen);
+    }
+  }
+
+  for (let i = 0; i < N; i++) {
+    if (weightSum[i] > 1e-6) out[i] /= weightSum[i];
+  }
+  return out;
+}
+
+/**
+ * LGI: Local Group Invariance (Pilz et al., CVPRW 2018 / pyVHR / rPPG-Toolbox)
+ * Computes rank-1 SVD eigenvector u1 of local channel covariance and projects onto invariant subspace P = I - u1*u1^T,
+ * providing strong invariance to non-uniform room lighting shifts and rigid head rotation.
+ */
+function extractLgiSignal(
+  r: Float64Array,
+  g: Float64Array,
+  b: Float64Array,
+  fs: number
+): Float64Array {
+  const N = r.length;
+  const out = new Float64Array(N);
+  const weightSum = new Float64Array(N);
+  const winLen = Math.max(24, Math.round(1.6 * fs));
+
+  const processWindow = (start: number, len: number) => {
+    let mr = 0,
+      mg = 0,
+      mb = 0;
+    for (let j = 0; j < len; j++) {
+      mr += r[start + j];
+      mg += g[start + j];
+      mb += b[start + j];
+    }
+    mr = mr / len || 1;
+    mg = mg / len || 1;
+    mb = mb / len || 1;
+
+    const rn = new Float64Array(len);
+    const gn = new Float64Array(len);
+    const bn = new Float64Array(len);
+    for (let j = 0; j < len; j++) {
+      rn[j] = r[start + j] / mr - 1;
+      gn[j] = g[start + j] / mg - 1;
+      bn[j] = b[start + j] / mb - 1;
+    }
+
+    const chans = [rn, gn, bn];
+    const C = [
+      [0, 0, 0],
+      [0, 0, 0],
+      [0, 0, 0],
+    ];
+    for (let i = 0; i < 3; i++) {
+      for (let j = i; j < 3; j++) {
+        const val = meanProduct(chans[i], chans[j]);
+        C[i][j] = val;
+        C[j][i] = val;
+      }
+    }
+
+    const { evals, V } = jacobiEigen3x3(C);
+    let maxIdx = 0;
+    if (evals[1] > evals[maxIdx]) maxIdx = 1;
+    if (evals[2] > evals[maxIdx]) maxIdx = 2;
+    const u0 = V[0][maxIdx];
+    const u1 = V[1][maxIdx];
+    const u2 = V[2][maxIdx];
+
+    // Invariant projection P * d_bvp where P = I - u1*u1^T removes dominant local illumination/motion mode
+    const d0 = -0.45,
+      d1 = 0.85,
+      d2 = -0.4;
+    const dotU = u0 * d0 + u1 * d1 + u2 * d2;
+    let p0 = d0 - dotU * u0;
+    let p1 = d1 - dotU * u1;
+    let p2 = d2 - dotU * u2;
+    let pNorm = Math.hypot(p0, p1, p2);
+
+    if (pNorm < 0.08) {
+      // Fallback to 2nd eigenvector when dominant mode is orthogonal to standard illumination vector
+      const secIdx = maxIdx === 0 ? 1 : 0;
+      p0 = V[0][secIdx];
+      p1 = V[1][secIdx];
+      p2 = V[2][secIdx];
+      pNorm = Math.hypot(p0, p1, p2) || 1;
+    }
+    p0 /= pNorm;
+    p1 /= pNorm;
+    p2 /= pNorm;
+
+    for (let j = 0; j < len; j++) {
+      const w = 0.54 - 0.46 * Math.cos((2 * Math.PI * j) / Math.max(1, len - 1));
+      out[start + j] += w * (p0 * rn[j] + p1 * gn[j] + p2 * bn[j]);
+      weightSum[start + j] += w;
+    }
+  };
+
+  if (N <= winLen) {
+    processWindow(0, N);
+  } else {
+    const step = Math.max(1, Math.floor(winLen / 4));
+    for (let start = 0; start <= N - winLen; start += step) {
+      processWindow(start, winLen);
+    }
+    if ((N - winLen) % step !== 0) {
+      processWindow(N - winLen, winLen);
+    }
+  }
+
+  for (let i = 0; i < N; i++) {
+    if (weightSum[i] > 1e-6) out[i] /= weightSum[i];
+  }
+  return out;
+}
+
 function selectBvpSignal(
   r: Float64Array,
   g: Float64Array,
@@ -1080,14 +1620,27 @@ function selectBvpSignal(
 ): Float64Array {
   if (mode === "finger") return extractGreenSignal(r, g, "finger");
   if (algorithm === "CHROM") return extractChromSignal(r, g, b, fs);
+  if (algorithm === "OMIT") return extractOmitSignal(r, g, b, fs);
+  if (algorithm === "PBV") return extractPbvSignal(r, g, b, fs);
+  if (algorithm === "LGI") return extractLgiSignal(r, g, b, fs);
   if (algorithm === "ICA") return extractIcaSignal(r, g, b, fs);
   if (algorithm === "GREEN") return extractGreenSignal(r, g, mode);
   return extractPosSignal(r, g, b, fs);
 }
 
+interface AlgoWeightsBreakdown {
+  pos: number;
+  chrom: number;
+  omit: number;
+  pbv: number;
+  lgi: number;
+  ica: number;
+  green: number;
+}
+
 interface AlgoFusionResult {
   filtered: Float64Array;
-  weights: { pos: number; chrom: number; ica: number; green: number };
+  weights: AlgoWeightsBreakdown;
 }
 
 function normalizeUnitStd(arr: Float64Array): Float64Array {
@@ -1149,8 +1702,8 @@ function detrendSlidingMean(signal: Float64Array, halfWin: number): Float64Array
 }
 
 /**
- * Quad-Algorithm Phase-Aligned Fusion (POS + CHROM + FastICA + GREEN) with SNR SoftMax,
- * Welch spectral evaluation, and 4-way fundamental frequency consensus boosting.
+ * 7-Algorithm Phase-Aligned Consensus Fusion (POS + CHROM + OMIT + PBV + LGI + FastICA + GREEN)
+ * with SNR SoftMax, Welch PSD, and 7-way fundamental frequency consensus voting (pyVHR / rPPG-Toolbox).
  */
 function extractBandpassedByAlgorithm(
   r: Float64Array,
@@ -1158,7 +1711,8 @@ function extractBandpassedByAlgorithm(
   b: Float64Array,
   algorithm: RppgAlgorithm,
   mode: CaptureMode,
-  fs: number
+  fs: number,
+  priorBpm?: number | null
 ): AlgoFusionResult {
   const halfDetrend = Math.max(8, Math.round(fs * 0.75));
 
@@ -1168,124 +1722,119 @@ function extractBandpassedByAlgorithm(
       halfDetrend
     );
     const filtered = zeroPhaseBandpass(raw, fs, 0.7, 3.5);
-    const w =
-      mode === "finger" || algorithm === "GREEN"
-        ? { pos: 0, chrom: 0, ica: 0, green: 100 }
-        : algorithm === "CHROM"
-        ? { pos: 0, chrom: 100, ica: 0, green: 0 }
-        : algorithm === "ICA"
-        ? { pos: 0, chrom: 0, ica: 100, green: 0 }
-        : { pos: 100, chrom: 0, ica: 0, green: 0 };
+    const w: AlgoWeightsBreakdown = {
+      pos: algorithm === "POS" && mode !== "finger" ? 100 : 0,
+      chrom: algorithm === "CHROM" && mode !== "finger" ? 100 : 0,
+      omit: algorithm === "OMIT" && mode !== "finger" ? 100 : 0,
+      pbv: algorithm === "PBV" && mode !== "finger" ? 100 : 0,
+      lgi: algorithm === "LGI" && mode !== "finger" ? 100 : 0,
+      ica: algorithm === "ICA" && mode !== "finger" ? 100 : 0,
+      green: mode === "finger" || algorithm === "GREEN" ? 100 : 0,
+    };
     return { filtered, weights: w };
   }
 
-  const fPos = normalizeUnitStd(
-    zeroPhaseBandpass(
-      detrendSlidingMean(extractPosSignal(r, g, b, fs), halfDetrend),
-      fs,
-      0.7,
-      3.5
-    )
-  );
-  const fChromRaw = normalizeUnitStd(
-    zeroPhaseBandpass(
-      detrendSlidingMean(extractChromSignal(r, g, b, fs), halfDetrend),
-      fs,
-      0.7,
-      3.5
-    )
-  );
-  const fIcaRaw = normalizeUnitStd(
-    zeroPhaseBandpass(
-      detrendSlidingMean(extractIcaSignal(r, g, b, fs), halfDetrend),
-      fs,
-      0.7,
-      3.5
-    )
-  );
-  const fGreenRaw = normalizeUnitStd(
-    zeroPhaseBandpass(
-      detrendSlidingMean(extractGreenSignal(r, g, mode), halfDetrend),
-      fs,
-      0.7,
-      3.5
-    )
-  );
+  const prep = (raw: Float64Array) =>
+    normalizeUnitStd(
+      zeroPhaseBandpass(detrendSlidingMean(raw, halfDetrend), fs, 0.7, 3.5)
+    );
 
-  const fChrom = alignPolarityToRef(fChromRaw, fPos);
-  const fIca = alignPolarityToRef(fIcaRaw, fPos);
-  const fGreen = alignPolarityToRef(fGreenRaw, fPos);
+  const fPos = prep(extractPosSignal(r, g, b, fs));
+  const fChrom = alignPolarityToRef(prep(extractChromSignal(r, g, b, fs)), fPos);
+  const fOmit = alignPolarityToRef(prep(extractOmitSignal(r, g, b, fs)), fPos);
+  const fPbv = alignPolarityToRef(prep(extractPbvSignal(r, g, b, fs)), fPos);
+  const fLgi = alignPolarityToRef(prep(extractLgiSignal(r, g, b, fs)), fPos);
+  const fIca = alignPolarityToRef(prep(extractIcaSignal(r, g, b, fs)), fPos);
+  const fGreen = alignPolarityToRef(prep(extractGreenSignal(r, g, mode)), fPos);
 
-  const sPos = evaluateCardiacSpectrum(fPos, fs);
-  const sChrom = evaluateCardiacSpectrum(fChrom, fs);
-  const sIca = evaluateCardiacSpectrum(fIca, fs);
-  const sGreen = evaluateCardiacSpectrum(fGreen, fs);
+  const sPos = evaluateCardiacSpectrum(fPos, fs, priorBpm);
+  const sChrom = evaluateCardiacSpectrum(fChrom, fs, priorBpm);
+  const sOmit = evaluateCardiacSpectrum(fOmit, fs, priorBpm);
+  const sPbv = evaluateCardiacSpectrum(fPbv, fs, priorBpm);
+  const sLgi = evaluateCardiacSpectrum(fLgi, fs, priorBpm);
+  const sIca = evaluateCardiacSpectrum(fIca, fs, priorBpm);
+  const sGreen = evaluateCardiacSpectrum(fGreen, fs, priorBpm);
 
-  // Inter-algorithm 4-way frequency consensus boost (±0.06 Hz ≈ ±3.6 BPM)
-  const near = (f1: number, f2: number) => Math.abs(f1 - f2) <= 0.06;
-  const consensusScore = (fSelf: number, others: number[]) => {
+  const freqs = [
+    sPos.dominantFreqHz,
+    sChrom.dominantFreqHz,
+    sOmit.dominantFreqHz,
+    sPbv.dominantFreqHz,
+    sLgi.dominantFreqHz,
+    sIca.dominantFreqHz,
+    sGreen.dominantFreqHz,
+  ];
+
+  // 7-way inter-algorithm fundamental frequency consensus voting (±0.055 Hz ≈ ±3.3 BPM)
+  const consensusScore = (idx: number) => {
+    const fSelf = freqs[idx];
     let mult = 1.0;
-    for (const fOther of others) {
-      if (near(fSelf, fOther)) mult *= 1.18;
+    for (let j = 0; j < freqs.length; j++) {
+      if (j !== idx && Math.abs(fSelf - freqs[j]) <= 0.055) {
+        mult *= 1.12;
+      }
     }
     return mult;
   };
 
-  const rawWPos =
-    1.22 *
-    consensusScore(sPos.dominantFreqHz, [
-      sChrom.dominantFreqHz,
-      sIca.dominantFreqHz,
-      sGreen.dominantFreqHz,
-    ]) *
-    Math.exp(Math.max(-4, Math.min(18, sPos.snrDb)) / 3.0);
-  const rawWChrom =
-    1.14 *
-    consensusScore(sChrom.dominantFreqHz, [
-      sPos.dominantFreqHz,
-      sIca.dominantFreqHz,
-      sGreen.dominantFreqHz,
-    ]) *
-    Math.exp(Math.max(-4, Math.min(18, sChrom.snrDb)) / 3.0);
-  const rawWIca =
-    0.96 *
-    consensusScore(sIca.dominantFreqHz, [
-      sPos.dominantFreqHz,
-      sChrom.dominantFreqHz,
-      sGreen.dominantFreqHz,
-    ]) *
-    Math.exp(Math.max(-4, Math.min(18, sIca.snrDb)) / 3.0);
-  const rawWGreen =
-    0.76 *
-    consensusScore(sGreen.dominantFreqHz, [
-      sPos.dominantFreqHz,
-      sChrom.dominantFreqHz,
-      sIca.dominantFreqHz,
-    ]) *
-    Math.exp(Math.max(-4, Math.min(18, sGreen.snrDb)) / 3.0);
+  const snrTerm = (snrDb: number) =>
+    Math.exp(Math.max(-4, Math.min(18, snrDb)) / 3.0);
 
-  const wSum = rawWPos + rawWChrom + rawWIca + rawWGreen || 1;
+  const rawWPos = 1.18 * consensusScore(0) * snrTerm(sPos.snrDb);
+  const rawWChrom = 1.12 * consensusScore(1) * snrTerm(sChrom.snrDb);
+  const rawWOmit = 1.15 * consensusScore(2) * snrTerm(sOmit.snrDb);
+  const rawWPbv = 1.06 * consensusScore(3) * snrTerm(sPbv.snrDb);
+  const rawWLgi = 1.08 * consensusScore(4) * snrTerm(sLgi.snrDb);
+  const rawWIca = 0.92 * consensusScore(5) * snrTerm(sIca.snrDb);
+  const rawWGreen = 0.72 * consensusScore(6) * snrTerm(sGreen.snrDb);
+
+  const wSum =
+    rawWPos +
+      rawWChrom +
+      rawWOmit +
+      rawWPbv +
+      rawWLgi +
+      rawWIca +
+      rawWGreen || 1;
   const wp = rawWPos / wSum;
   const wc = rawWChrom / wSum;
+  const wo = rawWOmit / wSum;
+  const wpbv = rawWPbv / wSum;
+  const wlgi = rawWLgi / wSum;
   const wi = rawWIca / wSum;
   const wg = rawWGreen / wSum;
 
   const fused = new Float64Array(fPos.length);
   for (let i = 0; i < fPos.length; i++) {
     fused[i] =
-      wp * fPos[i] + wc * fChrom[i] + wi * fIca[i] + wg * fGreen[i];
+      wp * fPos[i] +
+      wc * fChrom[i] +
+      wo * fOmit[i] +
+      wpbv * fPbv[i] +
+      wlgi * fLgi[i] +
+      wi * fIca[i] +
+      wg * fGreen[i];
   }
 
   const wpInt = Math.round(wp * 100);
   const wcInt = Math.round(wc * 100);
+  const woInt = Math.round(wo * 100);
+  const wpbvInt = Math.round(wpbv * 100);
+  const wlgiInt = Math.round(wlgi * 100);
   const wiInt = Math.round(wi * 100);
   return {
     filtered: fused,
     weights: {
       pos: wpInt,
       chrom: wcInt,
+      omit: woInt,
+      pbv: wpbvInt,
+      lgi: wlgiInt,
       ica: wiInt,
-      green: Math.max(0, 100 - wpInt - wcInt - wiInt),
+      green: Math.max(
+        0,
+        100 - wpInt - wcInt - woInt - wpbvInt - wlgiInt - wiInt
+      ),
     },
   };
 }
@@ -1842,9 +2391,93 @@ function detectSystolicPeaksAndPoincare(
   };
 }
 
+function detrendLinear(signal: Float64Array): Float64Array {
+  const N = signal.length;
+  if (N < 4) return new Float64Array(signal);
+  const mx = (N - 1) / 2;
+  const my = mean(signal);
+  let num = 0;
+  let den = 0;
+  for (let i = 0; i < N; i++) {
+    const dx = i - mx;
+    num += dx * (signal[i] - my);
+    den += dx * dx;
+  }
+  const slope = den > 1e-12 ? num / den : 0;
+  const out = new Float64Array(N);
+  for (let i = 0; i < N; i++) {
+    out[i] = signal[i] - (my + slope * (i - mx));
+  }
+  return out;
+}
+
+function computeHannPower(signal: Float64Array, fftSize: number): Float64Array {
+  // fftReal already applies a single Hann window; only subtract DC here to avoid Hann^2 main-lobe broadening
+  const N = signal.length;
+  const centered = new Float64Array(N);
+  const m = mean(signal);
+  for (let i = 0; i < N; i++) {
+    centered[i] = signal[i] - m;
+  }
+  return fftReal(centered, fftSize);
+}
+
+function computeRespPeriodicity(signal4Hz: Float64Array): {
+  brpm: number | null;
+  periodicity: number;
+} {
+  const N = signal4Hz.length;
+  if (N < Math.round(RESP_FS * 5.0)) {
+    return { brpm: null, periodicity: 0 };
+  }
+  const minLag = Math.max(6, Math.round(1.8 * RESP_FS)); // ~33 BrPM max
+  const maxLag = Math.min(Math.floor(N * 0.72), Math.round(8.0 * RESP_FS)); // covers down to ~7.5 BrPM
+  if (maxLag <= minLag + 2) return { brpm: null, periodicity: 0 };
+
+  const m = mean(signal4Hz);
+  let bestLag = minLag;
+  let bestR = -1;
+  const corr = new Float64Array(maxLag + 1);
+
+  for (let lag = minLag; lag <= maxLag; lag++) {
+    let num = 0;
+    let denA = 0;
+    let denB = 0;
+    const limit = N - lag;
+    for (let i = 0; i < limit; i++) {
+      const a = signal4Hz[i] - m;
+      const b = signal4Hz[i + lag] - m;
+      num += a * b;
+      denA += a * a;
+      denB += b * b;
+    }
+    const denom = Math.sqrt(denA * denB);
+    const r = denom > 1e-9 ? num / denom : 0;
+    corr[lag] = r;
+    if (r > bestR) {
+      bestR = r;
+      bestLag = lag;
+    }
+  }
+
+  if (bestR < 0.22) return { brpm: null, periodicity: Math.max(0, bestR) };
+
+  const rL = corr[bestLag - 1] ?? bestR;
+  const rC = corr[bestLag];
+  const rR = corr[bestLag + 1] ?? bestR;
+  const denom = rL - 2 * rC + rR;
+  const delta = Math.abs(denom) > 1e-9 ? (0.5 * (rL - rR)) / denom : 0;
+  const refinedLag = bestLag + Math.max(-0.5, Math.min(0.5, delta));
+
+  return {
+    brpm: (60 * RESP_FS) / refinedLag,
+    periodicity: bestR,
+  };
+}
+
 function computeRespComponentSnr(signal4Hz: Float64Array): number {
   const fftSize = 512;
-  const power = fftReal(signal4Hz, fftSize);
+  const power = computeHannPower(signal4Hz, fftSize);
   const binResHz = RESP_FS / fftSize;
   const minBin = Math.max(1, Math.floor(0.12 / binResHz));
   const maxBin = Math.min(power.length - 2, Math.ceil(0.52 / binResHz));
@@ -1860,7 +2493,9 @@ function computeRespComponentSnr(signal4Hz: Float64Array): number {
     }
   }
 
-  const halfBins = Math.max(2, Math.round(0.05 / binResHz));
+  // Scale spectral lobe width dynamically with the Rayleigh resolution of signal4Hz.length
+  const sigHalfHz = Math.max(0.05, 1.45 * (RESP_FS / Math.max(16, signal4Hz.length)));
+  const halfBins = Math.max(2, Math.round(sigHalfHz / binResHz));
   let sigPower = 0;
   for (let i = minBin; i <= maxBin; i++) {
     if (Math.abs(i - peakBin) <= halfBins) sigPower += power[i];
@@ -1913,14 +2548,37 @@ function computeCardiorespiratoryCoherence(
   return Math.max(0, Math.min(99, Math.round(bestCorr * 100)));
 }
 
+function filterAnchorOutliers(
+  anchors: Array<{ idx: number; val: number }>,
+  minAllowed: number,
+  maxAllowed: number,
+  madFactor = 3.0
+): Array<{ idx: number; val: number }> {
+  if (anchors.length < 5) {
+    return anchors.filter((a) => a.val >= minAllowed && a.val <= maxAllowed);
+  }
+  const sorted = anchors.map((a) => a.val).sort((a, b) => a - b);
+  const med = sorted[Math.floor(sorted.length / 2)];
+  const devs = sorted.map((v) => Math.abs(v - med)).sort((a, b) => a - b);
+  const mad = Math.max(1e-6, devs[Math.floor(devs.length / 2)] * 1.4826);
+  const lo = Math.max(minAllowed, med - madFactor * mad);
+  const hi = Math.min(maxAllowed, med + madFactor * mad);
+  return anchors.map((a) => ({
+    idx: a.idx,
+    val: Math.max(lo, Math.min(hi, a.val)),
+  }));
+}
+
 function estimateRespiration(
   r30: Float64Array,
   g30: Float64Array,
   b30: Float64Array,
   durationSec: number,
+  nowMs: number,
   algorithm: RppgAlgorithm,
   mode: CaptureMode,
-  signalState: SignalQualityState
+  signalState: SignalQualityState,
+  respTracker?: RespirationTracker
 ): {
   respirationBrpm: number | null;
   respSnrDb: number;
@@ -1948,7 +2606,8 @@ function estimateRespiration(
   }
 
   const rawBvp = selectBvpSignal(r30, g30, b30, algorithm, mode, TARGET_FS);
-  const cardiacBvp = zeroPhaseBandpass(rawBvp, TARGET_FS, 0.7, 3.5);
+  const detrendedBvp = detrendSlidingMean(rawBvp, Math.round(TARGET_FS * 0.75));
+  const cardiacBvp = zeroPhaseBandpass(detrendedBvp, TARGET_FS, 0.7, 3.5);
 
   const sigmaCard = stdDev(cardiacBvp) || 1;
   const minPeakDist = Math.round(0.32 * TARGET_FS);
@@ -1972,8 +2631,8 @@ function estimateRespiration(
     }
   }
 
-  const ampAnchors: Array<{ idx: number; amp: number }> = [];
-  const hrAnchors: Array<{ idx: number; instBpm: number }> = [];
+  const rawAmpAnchors: Array<{ idx: number; val: number }> = [];
+  const rawHrAnchors: Array<{ idx: number; val: number }> = [];
 
   for (let p = 0; p < peakIdx.length; p++) {
     const pk = peakIdx[p];
@@ -1983,30 +2642,33 @@ function estimateRespiration(
     for (let k = searchStart; k < pk; k++) {
       if (cardiacBvp[k] < minVal) minVal = cardiacBvp[k];
     }
-    ampAnchors.push({ idx: pk, amp: Math.max(0, cardiacBvp[pk] - minVal) });
+    rawAmpAnchors.push({ idx: pk, val: Math.max(0, cardiacBvp[pk] - minVal) });
 
     if (p > 0) {
       const dtSec = (pk - peakIdx[p - 1]) / TARGET_FS;
       if (dtSec >= 0.33 && dtSec <= 1.45) {
-        hrAnchors.push({ idx: pk, instBpm: 60 / dtSec });
+        rawHrAnchors.push({ idx: pk, val: 60 / dtSec });
       }
     }
   }
+
+  const ampAnchors = filterAnchorOutliers(rawAmpAnchors, 0, Infinity, 3.0);
+  const hrAnchors = filterAnchorOutliers(rawHrAnchors, 40, 195, 2.8);
 
   const riav30 = new Float64Array(N);
   if (ampAnchors.length >= 4) {
     let aIdx = 0;
     for (let i = 0; i < N; i++) {
       if (i <= ampAnchors[0].idx) {
-        riav30[i] = ampAnchors[0].amp;
+        riav30[i] = ampAnchors[0].val;
       } else if (i >= ampAnchors[ampAnchors.length - 1].idx) {
-        riav30[i] = ampAnchors[ampAnchors.length - 1].amp;
+        riav30[i] = ampAnchors[ampAnchors.length - 1].val;
       } else {
         while (aIdx < ampAnchors.length - 2 && ampAnchors[aIdx + 1].idx < i) aIdx++;
         const b0 = ampAnchors[aIdx];
         const b1 = ampAnchors[aIdx + 1];
         const t = (i - b0.idx) / (b1.idx - b0.idx || 1);
-        riav30[i] = b0.amp + t * (b1.amp - b0.amp);
+        riav30[i] = b0.val + t * (b1.val - b0.val);
       }
     }
   } else {
@@ -2028,15 +2690,15 @@ function estimateRespiration(
     let hIdx = 0;
     for (let i = 0; i < N; i++) {
       if (i <= hrAnchors[0].idx) {
-        rifv30[i] = hrAnchors[0].instBpm;
+        rifv30[i] = hrAnchors[0].val;
       } else if (i >= hrAnchors[hrAnchors.length - 1].idx) {
-        rifv30[i] = hrAnchors[hrAnchors.length - 1].instBpm;
+        rifv30[i] = hrAnchors[hrAnchors.length - 1].val;
       } else {
         while (hIdx < hrAnchors.length - 2 && hrAnchors[hIdx + 1].idx < i) hIdx++;
         const h0 = hrAnchors[hIdx];
         const h1 = hrAnchors[hIdx + 1];
         const t = (i - h0.idx) / (h1.idx - h0.idx || 1);
-        rifv30[i] = h0.instBpm + t * (h1.instBpm - h0.instBpm);
+        rifv30[i] = h0.val + t * (h1.val - h0.val);
       }
     }
   }
@@ -2080,10 +2742,11 @@ function estimateRespiration(
     rifv4[i] = cnt > 0 && hasRifv ? sumF / cnt : 0;
   }
 
-  const filtRiav = zeroPhaseBandpass(riav4, RESP_FS, 0.12, 0.55);
-  const filtRiiv = zeroPhaseBandpass(riiv4, RESP_FS, 0.12, 0.55);
+  // Linear detrend avoids sliding-window boundary curvature on 10–12s buffers
+  const filtRiav = zeroPhaseBandpass(detrendLinear(riav4), RESP_FS, 0.12, 0.55);
+  const filtRiiv = zeroPhaseBandpass(detrendLinear(riiv4), RESP_FS, 0.12, 0.55);
   const filtRifv = hasRifv
-    ? zeroPhaseBandpass(rifv4, RESP_FS, 0.12, 0.55)
+    ? zeroPhaseBandpass(detrendLinear(rifv4), RESP_FS, 0.12, 0.55)
     : new Float64Array(outLen);
 
   const stdA = stdDev(filtRiav) || 1;
@@ -2109,60 +2772,110 @@ function estimateRespiration(
     return cnt > 0 ? Math.sqrt(sq / cnt) : 0;
   };
 
-  // Sliding 2.5s respiratory modulation envelope (1.0 ≈ nominal resting breathing)
-  const compositeEnv = new Float64Array(outLen);
-  for (let i = 0; i < outLen; i++) {
-    const normA = localRms(relRiav, i, 5) / 0.055;
-    const normI = localRms(filtRiiv, i, 5) / 0.00055;
-    const normF = hasRifv ? localRms(filtRifv, i, 5) / 1.15 : 0;
-    compositeEnv[i] = hasRifv
-      ? 0.44 * normA + 0.22 * normI + 0.34 * normF
-      : 0.65 * normA + 0.35 * normI;
-  }
-
-  // Compare recent ~5s respiratory modulation vs earlier breathing baseline
-  const recentTailLen = Math.min(outLen, 20); // 5.0s at 4 Hz
-  const recentSlice = compositeEnv.subarray(outLen - recentTailLen);
-  const recentEnv = mean(recentSlice);
-
-  const earlierEnd = Math.max(0, outLen - recentTailLen);
-  let baselineEnv = 0;
-  if (earlierEnd >= 12) {
-    const earlierSorted = Array.from(compositeEnv.subarray(0, earlierEnd)).sort(
-      (a, b) => a - b
-    );
-    baselineEnv = earlierSorted[Math.floor(earlierSorted.length * 0.7)];
-  }
-
   const snrA = computeRespComponentSnr(filtRiav);
   const snrI = computeRespComponentSnr(filtRiiv);
   const snrF = hasRifv ? computeRespComponentSnr(filtRifv) : -20;
 
-  const wA = Math.exp(Math.max(-4, snrA) / 4) * 1.4;
-  const wI = Math.exp(Math.max(-4, snrI) / 4) * 0.7;
-  const wF = hasRifv ? Math.exp(Math.max(-4, snrF) / 4) * 0.9 : 0;
+  // Separate cardiac-coupled envelope (RIAV + RSA/RIFV) from raw green intensity drift (RIIV)
+  const rawCardiacEnv = new Float64Array(outLen);
+  const rawCompositeEnv = new Float64Array(outLen);
+  const riivTrust = snrI >= 0.8 ? 0.18 : 0.08;
+  for (let i = 0; i < outLen; i++) {
+    const normA = localRms(relRiav, i, 4) / 0.052;
+    const normI = localRms(filtRiiv, i, 4) / 0.00062;
+    const normF = hasRifv ? localRms(filtRifv, i, 4) / 1.45 : 0;
+    const cardEnv = hasRifv ? 0.64 * normA + 0.36 * normF : normA;
+    rawCardiacEnv[i] = cardEnv;
+    rawCompositeEnv[i] = (1 - riivTrust) * cardEnv + riivTrust * normI;
+  }
+
+  // 3-tap smoothing prevents 1 noisy webcam frame from breaking consecutive hold tracking
+  const cardiacEnv = new Float64Array(outLen);
+  const compositeEnv = new Float64Array(outLen);
+  for (let i = 0; i < outLen; i++) {
+    const prev = Math.max(0, i - 1);
+    const next = Math.min(outLen - 1, i + 1);
+    cardiacEnv[i] =
+      0.25 * rawCardiacEnv[prev] + 0.5 * rawCardiacEnv[i] + 0.25 * rawCardiacEnv[next];
+    compositeEnv[i] =
+      0.25 * rawCompositeEnv[prev] + 0.5 * rawCompositeEnv[i] + 0.25 * rawCompositeEnv[next];
+  }
+
+  // Evaluate recent ~4.75s modulation vs earlier & tracker-learned personal baseline
+  const recentTailLen = Math.min(outLen, 19); // 4.75s at 4 Hz
+  const recentEnv = mean(compositeEnv.subarray(outLen - recentTailLen));
+  const recentCardiacEnv = mean(cardiacEnv.subarray(outLen - recentTailLen));
+
+  const earlierEnd = Math.max(0, outLen - recentTailLen);
+  let earlierBaselineEnv = 0;
+  let earlierCardiacBaseline = 0;
+  if (earlierEnd >= 10) {
+    const earlierSorted = Array.from(compositeEnv.subarray(0, earlierEnd)).sort(
+      (a, b) => a - b
+    );
+    earlierBaselineEnv = earlierSorted[Math.floor(earlierSorted.length * 0.72)];
+    const earlierCardSorted = Array.from(cardiacEnv.subarray(0, earlierEnd)).sort(
+      (a, b) => a - b
+    );
+    earlierCardiacBaseline = earlierCardSorted[Math.floor(earlierCardSorted.length * 0.72)];
+  }
+
+  const learned = respTracker?.getLearnedBaseline() ?? { env: 0, cardiacEnv: 0 };
+  const effectiveBaselineEnv = Math.max(earlierBaselineEnv, learned.env);
+  const effectiveCardBaseline = Math.max(earlierCardiacBaseline, learned.cardiacEnv);
+
+  const corrIA = Math.abs(pearsonCorrelation(filtRiiv, filtRiav));
+  const riivAlignedFactor =
+    corrIA >= 0.35 ? 1.0 : corrIA >= 0.22 || !hasRifv ? 0.45 : 0.14;
+  const wA = Math.exp(Math.min(7.5, Math.max(-4, snrA)) / 3.8) * 1.65;
+  const wI =
+    Math.exp(Math.min(5.5, Math.max(-4, snrI)) / 3.8) *
+    (snrI >= 0.5 ? 0.44 : 0.22) *
+    riivAlignedFactor;
+  const wF = hasRifv
+    ? Math.exp(Math.min(7.5, Math.max(-4, snrF)) / 3.8) * 1.3
+    : 0;
   const wSum = wA + wI + wF || 1;
 
   const fused = new Float64Array(outLen);
+  const fusedCardUnnorm = new Float64Array(outLen);
   for (let i = 0; i < outLen; i++) {
     fused[i] =
       (wA * (filtRiav[i] / stdA) +
         wI * (filtRiiv[i] / stdI) +
         wF * (filtRifv[i] / stdF)) /
       wSum;
+    fusedCardUnnorm[i] =
+      (wA * relRiav[i] + (hasRifv ? wF * (filtRifv[i] / 24) : 0)) /
+      (wA + (hasRifv ? wF : 0) || 1);
   }
 
-  const recentFusedLen = Math.min(outLen, 32);
+  // 9.0s tail (36 samples) covers full period of slow 10–14 BrPM breathing while spotting 4–6s holds
+  const recentFusedLen = Math.min(outLen, 36);
   const recentRespSnrDb =
     recentFusedLen >= 20
-      ? computeRespComponentSnr(fused.subarray(outLen - recentFusedLen))
+      ? computeRespComponentSnr(fusedCardUnnorm.subarray(outLen - recentFusedLen))
       : 0;
+  const recentAutocorr =
+    recentFusedLen >= 22
+      ? computeRespPeriodicity(fusedCardUnnorm.subarray(outLen - recentFusedLen))
+      : { brpm: null, periodicity: 0 };
 
   const holdThresh =
-    baselineEnv >= 0.48 ? Math.max(0.32, baselineEnv * 0.42) : 0.34;
+    effectiveBaselineEnv >= 0.40 ? Math.max(0.30, effectiveBaselineEnv * 0.50) : 0.36;
+  const cardHoldThresh =
+    effectiveCardBaseline >= 0.35 ? Math.max(0.28, effectiveCardBaseline * 0.54) : 0.38;
+
+  // Tolerate up to 1 momentary micro-glitch sample in tail so single-frame noise doesn't reset hold count
   let suppressedSamples = 0;
+  let blipBudget = 1;
   for (let i = outLen - 1; i >= 0; i--) {
-    if (compositeEnv[i] < holdThresh) {
+    const isSuppressed =
+      compositeEnv[i] < holdThresh || cardiacEnv[i] < cardHoldThresh;
+    if (isSuppressed) {
+      suppressedSamples++;
+    } else if (blipBudget > 0 && i < outLen - 2) {
+      blipBudget--;
       suppressedSamples++;
     } else {
       break;
@@ -2170,34 +2883,75 @@ function estimateRespiration(
   }
   const rawHoldSec = suppressedSamples / RESP_FS;
 
-  const sharpDropFromBreathing =
-    baselineEnv >= 0.48 && recentEnv < baselineEnv * 0.38 && recentEnv < 0.56;
-  const flatAbsoluteModulation = recentEnv < 0.28 && durationSec >= 9.0;
-  const weakSpectralAndLowEnv =
-    recentEnv < 0.46 && recentRespSnrDb < 0.5 && rawHoldSec >= 4.2;
+  // Multi-evidence continuous breath-hold score (0..1)
+  let holdScore = 0;
+  if (effectiveBaselineEnv >= 0.36 || effectiveCardBaseline >= 0.35) {
+    const dropRatio =
+      effectiveBaselineEnv > 0.25 ? recentEnv / effectiveBaselineEnv : 1;
+    const cardDropRatio =
+      effectiveCardBaseline > 0.25 ? recentCardiacEnv / effectiveCardBaseline : dropRatio;
+    const bestDrop = Math.min(dropRatio, cardDropRatio);
+    if (bestDrop <= 0.40) holdScore += 0.56;
+    else if (bestDrop <= 0.54) holdScore += 0.42;
+    else if (bestDrop <= 0.65) holdScore += 0.22;
+  }
 
-  const isBreathHold =
-    durationSec >= 8.5 &&
-    signalState !== "no_skin" &&
-    signalState !== "low_light" &&
-    signalState !== "motion" &&
-    (rawHoldSec >= 4.2 ||
-      sharpDropFromBreathing ||
-      flatAbsoluteModulation ||
-      weakSpectralAndLowEnv);
+  if (recentCardiacEnv < 0.32) holdScore += 0.46;
+  else if (recentCardiacEnv < 0.42) holdScore += 0.30;
+  else if (recentCardiacEnv < 0.50 && recentEnv < 0.50) holdScore += 0.14;
 
-  const breathHoldSeconds = isBreathHold
-    ? Number(Math.max(4.5, rawHoldSec).toFixed(1))
-    : 0;
+  if (rawHoldSec >= 4.2) holdScore += 0.36;
+  else if (rawHoldSec >= 3.0) holdScore += 0.24;
+
+  if (recentAutocorr.periodicity < 0.30 && recentRespSnrDb < 1.2) {
+    holdScore += 0.24;
+  } else if (recentAutocorr.periodicity >= 0.52 && recentRespSnrDb >= 1.8) {
+    holdScore -= 0.34; // Strong rhythmic cardiac-coupled breathing opposes hold classification
+  }
+  holdScore = Math.max(0, Math.min(1, holdScore));
+
+  const signalBlocked =
+    signalState === "no_skin" ||
+    signalState === "low_light" ||
+    signalState === "motion";
+
+  let isBreathHold = false;
+  let breathHoldSeconds = 0;
+  if (respTracker) {
+    const trackedHold = respTracker.updateHoldState({
+      durationSec,
+      nowMs,
+      holdScore,
+      recentEnv,
+      recentCardiacEnv,
+      recentSnrDb: recentRespSnrDb,
+      recentPeriodicity: recentAutocorr.periodicity,
+      rawHoldSec,
+      signalBlocked,
+    });
+    isBreathHold = trackedHold.isHold;
+    breathHoldSeconds = trackedHold.holdSeconds;
+  } else {
+    isBreathHold =
+      durationSec >= 7.5 &&
+      !signalBlocked &&
+      (holdScore >= 0.58 || (rawHoldSec >= 4.0 && recentCardiacEnv < 0.42));
+    breathHoldSeconds = isBreathHold
+      ? Number(Math.max(3.8, rawHoldSec).toFixed(1))
+      : 0;
+  }
+
   const respModulationPct = Math.max(
     0,
-    Math.min(100, Math.round(recentEnv * 45))
+    Math.min(100, Math.round(recentCardiacEnv * 45))
   );
 
   // Attenuate waveform regions where physical modulation collapsed so breath-hold visibly flattens
   const fusedStd = stdDev(fused) || 1;
+  const waveScaleBase = Math.max(0.48, effectiveCardBaseline * 0.78);
   const respWaveform = Array.from(fused).map((v, idx) => {
-    const envGain = Math.min(1, Math.max(0.06, compositeEnv[idx] / 0.45));
+    const localEnv = Math.min(compositeEnv[idx], cardiacEnv[idx] * 1.15);
+    const envGain = Math.min(1, Math.max(0.05, localEnv / waveScaleBase));
     return Math.max(-3.0, Math.min(3.0, (v / fusedStd) * envGain));
   });
 
@@ -2222,20 +2976,55 @@ function estimateRespiration(
     }
   }
 
+  // Hann-windowed FFT + Welch segment blend for higher BrPM spectral precision
   const fftSize = 512;
-  const power = fftReal(fused, fftSize);
-  const binResHz = RESP_FS / fftSize;
+  const fullPower = computeHannPower(fused, fftSize);
+  let power = fullPower;
+  const welchWin = Math.round(RESP_FS * 12);
+  const welchStep = Math.round(RESP_FS * 3);
+  if (outLen >= Math.round(RESP_FS * 15) && outLen > welchWin) {
+    const welchAcc = new Float64Array(fullPower.length);
+    let segCnt = 0;
+    for (let s = 0; s <= outLen - welchWin; s += welchStep) {
+      const segPow = computeHannPower(fused.subarray(s, s + welchWin), fftSize);
+      for (let i = 0; i < welchAcc.length; i++) welchAcc[i] += segPow[i];
+      segCnt++;
+    }
+    if (segCnt > 0) {
+      const blended = new Float64Array(fullPower.length);
+      for (let i = 0; i < fullPower.length; i++) {
+        blended[i] = 0.55 * fullPower[i] + 0.45 * (welchAcc[i] / segCnt);
+      }
+      power = blended;
+    }
+  }
 
-  const minBin = Math.max(1, Math.floor(0.12 / binResHz));
-  const maxBin = Math.min(power.length - 2, Math.ceil(0.52 / binResHz));
+  const binResHz = RESP_FS / fftSize;
+  const minBin = Math.max(1, Math.floor(0.11 / binResHz));
+  const maxBin = Math.min(power.length - 2, Math.ceil(0.54 / binResHz));
+
+  const fullAutocorr = computeRespPeriodicity(fused);
+  const priorEstBrpm = respTracker?.isLocked() ? respTracker.getEstimate() : null;
 
   let peakBin = minBin;
+  let maxScore = 0;
   let maxPower = 0;
   let totalBandPower = 0;
   for (let i = minBin; i <= maxBin; i++) {
     totalBandPower += power[i];
-    if (power[i] > maxPower) {
-      maxPower = power[i];
+    if (power[i] > maxPower) maxPower = power[i];
+    let score = power[i];
+    const candBrpm = i * binResHz * 60;
+    if (fullAutocorr.brpm !== null && fullAutocorr.periodicity >= 0.4) {
+      const diffAc = Math.abs(candBrpm - fullAutocorr.brpm);
+      if (diffAc <= 2.5) score *= 1.32;
+    }
+    if (priorEstBrpm !== null) {
+      const diffPrior = Math.abs(candBrpm - priorEstBrpm);
+      if (diffPrior <= 3.0) score *= 1.18;
+    }
+    if (score > maxScore) {
+      maxScore = score;
       peakBin = i;
     }
   }
@@ -2247,7 +3036,16 @@ function estimateRespiration(
   const delta = Math.abs(denom) > 1e-12 ? (0.5 * (pL - pR)) / denom : 0;
   const refinedBin = peakBin + Math.max(-0.5, Math.min(0.5, delta));
   const respFreqHz = refinedBin * binResHz;
-  const estimatedBrpm = Math.round(respFreqHz * 60);
+  let rawBrpm = Math.round(respFreqHz * 60);
+
+  // Blend with high-confidence autocorrelation if close (sub-bin stability)
+  if (
+    fullAutocorr.brpm !== null &&
+    fullAutocorr.periodicity >= 0.55 &&
+    Math.abs(fullAutocorr.brpm - rawBrpm) <= 2.5
+  ) {
+    rawBrpm = Math.round(0.65 * rawBrpm + 0.35 * fullAutocorr.brpm);
+  }
 
   const halfBins = Math.max(2, Math.round(0.05 / binResHz));
   let sigPower = 0;
@@ -2259,14 +3057,25 @@ function estimateRespiration(
     (10 * Math.log10(Math.max(0.05, sigPower / noisePower))).toFixed(1)
   );
 
-  const validResp =
+  const rawValidBrpm =
     !isBreathHold &&
     durationSec >= MIN_SECONDS_FOR_RESPIRATION &&
     respSnrDb >= 0.0 &&
-    signalState !== "no_skin" &&
-    signalState !== "low_light"
-      ? estimatedBrpm
+    !signalBlocked
+      ? rawBrpm
       : null;
+
+  const finalBrpm = respTracker
+    ? respTracker.updateBrpm(
+        rawValidBrpm,
+        respSnrDb,
+        fullAutocorr.periodicity,
+        signalState === "motion",
+        isBreathHold
+      )
+    : rawValidBrpm;
+
+  const validResp = !isBreathHold ? finalBrpm : null;
 
   const coherencePct =
     !isBreathHold && validResp !== null && hasRifv
@@ -2286,8 +3095,10 @@ function estimateRespiration(
 
   return {
     respirationBrpm: validResp,
-    respSnrDb: isBreathHold ? Number(Math.min(respSnrDb, recentRespSnrDb).toFixed(1)) : respSnrDb,
-    respFreqHz: validResp ? Number(respFreqHz.toFixed(3)) : null,
+    respSnrDb: isBreathHold
+      ? Number(Math.min(respSnrDb, recentRespSnrDb).toFixed(1))
+      : respSnrDb,
+    respFreqHz: validResp ? Number((validResp / 60).toFixed(3)) : null,
     respWaveform,
     respPeakIndices,
     coherencePct,
@@ -2301,7 +3112,12 @@ export function analyzeRppgBuffer(
   samples: RgbSample[],
   algorithm: RppgAlgorithm,
   mode: CaptureMode,
-  options?: { enableNlms?: boolean; enableAwb?: boolean; kalman?: KalmanBpmTracker }
+  options?: {
+    enableNlms?: boolean;
+    enableAwb?: boolean;
+    kalman?: KalmanBpmTracker;
+    respTracker?: RespirationTracker;
+  }
 ): RppgMetrics {
   const enableNlms = options?.enableNlms ?? true;
   const enableAwb = options?.enableAwb ?? true;
@@ -2350,14 +3166,16 @@ export function analyzeRppgBuffer(
       awb: uniform.awb,
       algoWeights:
         algorithm === "FUSION"
-          ? { pos: 36, chrom: 30, ica: 18, green: 16 }
-          : algorithm === "CHROM"
-          ? { pos: 0, chrom: 100, ica: 0, green: 0 }
-          : algorithm === "ICA"
-          ? { pos: 0, chrom: 0, ica: 100, green: 0 }
-          : algorithm === "GREEN" || mode === "finger"
-          ? { pos: 0, chrom: 0, ica: 0, green: 100 }
-          : { pos: 100, chrom: 0, ica: 0, green: 0 },
+          ? { pos: 22, chrom: 18, omit: 18, pbv: 14, lgi: 14, ica: 8, green: 6 }
+          : {
+              pos: algorithm === "POS" && mode !== "finger" ? 100 : 0,
+              chrom: algorithm === "CHROM" && mode !== "finger" ? 100 : 0,
+              omit: algorithm === "OMIT" && mode !== "finger" ? 100 : 0,
+              pbv: algorithm === "PBV" && mode !== "finger" ? 100 : 0,
+              lgi: algorithm === "LGI" && mode !== "finger" ? 100 : 0,
+              ica: algorithm === "ICA" && mode !== "finger" ? 100 : 0,
+              green: algorithm === "GREEN" || mode === "finger" ? 100 : 0,
+            },
       rmssdMs: null,
       sdnnMs: null,
       sd1Ms: null,
@@ -2398,13 +3216,20 @@ export function analyzeRppgBuffer(
 
   let filtered: Float64Array;
   let roiWeights = { forehead: 34, leftCheek: 33, rightCheek: 33 };
-  let algoWeights: { pos: number; chrom: number; ica: number; green: number } = {
+  let algoWeights: AlgoWeightsBreakdown = {
     pos: 100,
     chrom: 0,
+    omit: 0,
+    pbv: 0,
+    lgi: 0,
     ica: 0,
     green: 0,
   };
   let roiCoherenceScore = 0.75;
+
+  const regionPriorBpm = options?.kalman?.isLocked()
+    ? options.kalman.getEstimate()
+    : null;
 
   if (
     mode !== "finger" &&
@@ -2422,12 +3247,8 @@ export function analyzeRppgBuffer(
       key: "forehead" | "leftCheek" | "rightCheek";
       sig: Float64Array;
       rawWeight: number;
-      algoW: { pos: number; chrom: number; ica: number; green: number };
+      algoW: AlgoWeightsBreakdown;
     }> = [];
-
-    const regionPriorBpm = options?.kalman?.isLocked()
-      ? options.kalman.getEstimate()
-      : null;
 
     for (const reg of regions) {
       if (reg.ch.validRatio < 0.25) {
@@ -2435,7 +3256,7 @@ export function analyzeRppgBuffer(
           key: reg.key,
           sig: new Float64Array(r.length),
           rawWeight: 0,
-          algoW: { pos: 0, chrom: 0, ica: 0, green: 0 },
+          algoW: { pos: 0, chrom: 0, omit: 0, pbv: 0, lgi: 0, ica: 0, green: 0 },
         });
         continue;
       }
@@ -2445,7 +3266,8 @@ export function analyzeRppgBuffer(
         reg.ch.b.subarray(cardStart),
         algorithm,
         mode,
-        TARGET_FS
+        TARGET_FS,
+        regionPriorBpm
       );
       const filtR = resReg.filtered;
       const specR = evaluateCardiacSpectrum(filtR, TARGET_FS, regionPriorBpm);
@@ -2493,37 +3315,63 @@ export function analyzeRppgBuffer(
       }
 
       const totalW = alignedEntries.reduce((acc, item) => acc + item.cohWeight, 0) || 1;
-      let accPos = 0;
-      let accChrom = 0;
-      let accIca = 0;
-      let accGreen = 0;
+      let accPos = 0,
+        accChrom = 0,
+        accOmit = 0,
+        accPbv = 0,
+        accLgi = 0,
+        accIca = 0;
       for (const item of alignedEntries) {
         const wNorm = item.cohWeight / totalW;
         roiWeights[item.key] = Math.round(wNorm * 100);
         accPos += wNorm * item.algoW.pos;
         accChrom += wNorm * item.algoW.chrom;
+        accOmit += wNorm * item.algoW.omit;
+        accPbv += wNorm * item.algoW.pbv;
+        accLgi += wNorm * item.algoW.lgi;
         accIca += wNorm * item.algoW.ica;
-        accGreen += wNorm * item.algoW.green;
         for (let i = 0; i < filtered.length; i++) {
           filtered[i] += wNorm * item.alignedSig[i];
         }
       }
       const pInt = Math.round(accPos);
       const cInt = Math.round(accChrom);
+      const oInt = Math.round(accOmit);
+      const pbvInt = Math.round(accPbv);
+      const lgiInt = Math.round(accLgi);
       const iInt = Math.round(accIca);
       algoWeights = {
         pos: pInt,
         chrom: cInt,
+        omit: oInt,
+        pbv: pbvInt,
+        lgi: lgiInt,
         ica: iInt,
-        green: Math.max(0, 100 - pInt - cInt - iInt),
+        green: Math.max(0, 100 - pInt - cInt - oInt - pbvInt - lgiInt - iInt),
       };
     } else {
-      const fb = extractBandpassedByAlgorithm(r, g, b, algorithm, mode, TARGET_FS);
+      const fb = extractBandpassedByAlgorithm(
+        r,
+        g,
+        b,
+        algorithm,
+        mode,
+        TARGET_FS,
+        regionPriorBpm
+      );
       filtered = fb.filtered;
       algoWeights = fb.weights;
     }
   } else {
-    const fb = extractBandpassedByAlgorithm(r, g, b, algorithm, mode, TARGET_FS);
+    const fb = extractBandpassedByAlgorithm(
+      r,
+      g,
+      b,
+      algorithm,
+      mode,
+      TARGET_FS,
+      regionPriorBpm
+    );
     filtered = fb.filtered;
     algoWeights = fb.weights;
     if (mode === "finger") {
@@ -2636,14 +3484,17 @@ export function analyzeRppgBuffer(
       )
     : validRawBpm;
 
+  const latestTimeMs = samples[n - 1]?.t ?? uniform.durationSec * 1000;
   const resp = estimateRespiration(
     uniform.r,
     uniform.g,
     uniform.b,
     uniform.durationSec,
+    latestTimeMs,
     algorithm,
     mode,
-    signalState
+    signalState,
+    options?.respTracker
   );
 
   return {

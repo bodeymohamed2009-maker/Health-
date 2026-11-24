@@ -1,5 +1,13 @@
 export type CaptureMode = "face" | "finger";
-export type RppgAlgorithm = "FUSION" | "POS" | "CHROM" | "ICA" | "GREEN";
+export type RppgAlgorithm =
+  | "FUSION"
+  | "POS"
+  | "CHROM"
+  | "OMIT"
+  | "PBV"
+  | "LGI"
+  | "ICA"
+  | "GREEN";
 export type ScanDuration = 15 | 30 | 0; // 0 = continuous
 
 export type SignalQualityState =
@@ -78,6 +86,7 @@ export interface FaceBox {
   rx: number;
   ry: number;
   headTiltDeg?: number;
+  trackingSource?: "mediapipe" | "native" | "cv";
 }
 
 export interface RoiExtractionResult {
@@ -132,6 +141,9 @@ export interface RppgMetrics {
   algoWeights: {
     pos: number;
     chrom: number;
+    omit?: number;
+    pbv?: number;
+    lgi?: number;
     ica?: number;
     green: number;
   };

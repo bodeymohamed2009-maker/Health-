@@ -4,11 +4,11 @@ import { AnimatePresence, motion } from "motion/react";
 const PIPELINE_STEPS = [
   {
     num: "01",
-    title: "رصد تغيّر لون البشرة",
-    short: "تدفّق الدم في الشعيرات الدقيقة مع كل نبضة",
+    title: "تتبع تشريحي بـ 478 نقطة ورصد لون البشرة",
+    short: "تحديد الجبهة والخدين عبر شبكة عصبية وتتبع تدفّق الدم",
     detail:
-      "مع كل نبضة قلب، يتدفق الدم في الشعيرات الدقيقة بالوجه فيتغير امتصاص الضوء الأخضر والأحمر والأزرق بنسبة مجهرية لا تراها العين، وتلتقطها الكاميرا بمعدل 30 إطاراً في الثانية.",
-    spec: "Sampling 30 Hz · RGB Multi-ROI (Forehead + Bilateral Cheeks)",
+      "ترصد شبكة MediaPipe 478-Point Mesh (مع احتياطي CV Haar + Kalman) ملامح الجبهة والخدين بدقة ثلاثية الأبعاد، بينما تلتقط الكاميرا تغيّر امتصاص الضوء الأخضر والأحمر والأزرق بمعدل 30 إطاراً في الثانية.",
+    spec: "MediaPipe 478-Mesh + CV Kalman · RGB Multi-ROI",
   },
   {
     num: "02",
@@ -20,11 +20,11 @@ const PIPELINE_STEPS = [
   },
   {
     num: "03",
-    title: "استخراج النبض والتنفس",
-    short: "دمج POS وCHROM وICA مع FFT وKalman",
+    title: "استخراج النبض والتنفس بـ 7 خوارزميات",
+    short: "دمج POS وCHROM وOMIT وPBV وLGI وICA مع Welch FFT وKalman",
     detail:
-      "تفصل المرشحات الرقمية إيقاع القلب السريع عن إيقاع الشهيق والزفير الأبطأ، ثم يدمج المحرك الرباعي (POS + CHROM + ICA + GREEN) الطيف مع مرشح كالمان لتثبيت القراءة.",
-    spec: "Quad-Fusion + 1024-pt Welch FFT + Kalman State Tracker",
+      "تفصل المرشحات الرقمية إيقاع القلب السريع عن إيقاع الشهيق والزفير الأبطأ، ثم يدمج المحرك السباعي المعتمد من أبحاث pyVHR وrPPG-Toolbox الطيف بالتصويت التوافقي ومرشح كالمان لتثبيت القراءة.",
+    spec: "7-Way Fusion (OMIT/PBV/LGI/POS/CHROM/ICA) · 2048-pt Welch FFT",
   },
   {
     num: "04",

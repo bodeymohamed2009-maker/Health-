@@ -86,7 +86,7 @@ export function SessionReportModal({
                 <p dir="ltr" className="font-mono text-xs text-slate-600 dark:text-slate-400 mt-0.5">
                   {timestamp} ·{" "}
                   {algorithm === "FUSION"
-                    ? "QUAD-FUSION (POS+CHROM+ICA+GREEN)"
+                    ? "7-ALGO FUSION (POS+CHROM+OMIT+PBV+LGI+ICA+GRN)"
                     : algorithm}{" "}
                   · {mode.toUpperCase()}
                 </p>
@@ -330,11 +330,13 @@ export function SessionReportModal({
                     {algorithm === "FUSION" && (
                       <tr>
                         <td className="py-2.5 px-4 text-slate-600 dark:text-slate-400 print:text-slate-600">
-                          أوزان الدمج الرباعي (POS / CHROM / ICA / GREEN)
+                          أوزان الدمج السباعي (POS / CHROM / OMIT / PBV / LGI / ICA / GRN)
                         </td>
                         <td dir="ltr" className="py-2.5 px-4 font-mono tabular-nums">
                           {metrics.algoWeights.pos}% / {metrics.algoWeights.chrom}% /{" "}
-                          {metrics.algoWeights.ica ?? 0}% / {metrics.algoWeights.green}%
+                          {metrics.algoWeights.omit ?? 0}% / {metrics.algoWeights.pbv ?? 0}% /{" "}
+                          {metrics.algoWeights.lgi ?? 0}% / {metrics.algoWeights.ica ?? 0}% /{" "}
+                          {metrics.algoWeights.green}%
                         </td>
                       </tr>
                     )}

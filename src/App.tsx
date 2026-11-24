@@ -52,7 +52,11 @@ import {
 } from "./dsp/hydrationAlerts";
 import { evaluateHrvSmartAlert } from "./dsp/hrvInsights";
 import { getAgeAdjustedNorms } from "./dsp/hrvTrends";
-import { KalmanBpmTracker, analyzeRppgBuffer } from "./dsp/rppgEngine";
+import {
+  KalmanBpmTracker,
+  RespirationTracker,
+  analyzeRppgBuffer,
+} from "./dsp/rppgEngine";
 import type {
   BiometricProfile,
   CaptureMode,
@@ -81,7 +85,15 @@ const INITIAL_METRICS: RppgMetrics = {
     colorTempK: 5500,
     driftReducedPct: 0,
   },
-  algoWeights: { pos: 36, chrom: 30, ica: 18, green: 16 },
+  algoWeights: {
+    pos: 22,
+    chrom: 18,
+    omit: 18,
+    pbv: 14,
+    lgi: 14,
+    ica: 8,
+    green: 6,
+  },
   rmssdMs: null,
   sdnnMs: null,
   sd1Ms: null,
@@ -181,6 +193,7 @@ export default function App() {
   const samplesRef = useRef<RgbSample[]>([]);
   const extractorRef = useRef<RoiFrameExtractor>(new RoiFrameExtractor());
   const kalmanRef = useRef<KalmanBpmTracker>(new KalmanBpmTracker());
+  const respTrackerRef = useRef<RespirationTracker>(new RespirationTracker());
   const lastAnalyzeTimeRef = useRef<number>(0);
   const scanStartTimeRef = useRef<number>(0);
   const activeElapsedMsRef = useRef<number>(0);
@@ -532,7 +545,11 @@ export default function App() {
     setSaveNotice(null);
     samplesRef.current = [];
     extractorRef.current.reset();
+    if (mode === "face") {
+      extractorRef.current.warmupNeuralMesh();
+    }
     kalmanRef.current.reset();
+    respTrackerRef.current.reset();
     lastAnalyzeTimeRef.current = 0;
     const nowTs = performance.now();
     scanStartTimeRef.current = nowTs;
@@ -670,6 +687,7 @@ export default function App() {
           }
         }
         if (mode === "face") {
+          extractorRef.current.pollNeuralFaceMesh(video, now);
           extractorRef.current.pollNativeFaceDetector(video, now);
         }
         const ctx = canvas.getContext("2d", { willReadFrequently: true });
@@ -696,6 +714,7 @@ export default function App() {
                   // Long absence: start clean window without stale beats
                   samplesRef.current = [];
                   kalmanRef.current.reset();
+                  respTrackerRef.current.reset();
                 } else if (pauseDuration > 0 && samplesRef.current.length > 0) {
                   // Temporary departure: shift timestamps forward for gap-free continuity
                   for (const s of samplesRef.current) {
@@ -782,6 +801,7 @@ export default function App() {
             enableNlms: nlmsEnabled,
             enableAwb: awbEnabled,
             kalman: kalmanRef.current,
+            respTracker: respTrackerRef.current,
           }
         );
         setMetrics(computed);
@@ -917,6 +937,7 @@ export default function App() {
     setCameraError(null);
     setRoiBoxes([]);
     kalmanRef.current.reset();
+    respTrackerRef.current.reset();
     setMetrics(INITIAL_METRICS);
   }
 
@@ -1155,9 +1176,23 @@ export default function App() {
                   {mode === "finger"
                     ? "Contact PPG"
                     : algorithm === "FUSION"
-                    ? "Quad-Fusion"
+                    ? "7-Algo Fusion"
                     : algorithm}
                 </span>
+                {mode !== "finger" && (
+                  <>
+                    <span className="text-slate-400 dark:text-slate-700" aria-hidden="true">
+                      ·
+                    </span>
+                    <span className="text-emerald-700 dark:text-emerald-400">
+                      {faceBox.trackingSource === "mediapipe"
+                        ? "478-Mesh"
+                        : faceBox.trackingSource === "native"
+                        ? "Native-FD"
+                        : "CV-Haar"}
+                    </span>
+                  </>
+                )}
                 <span className="text-slate-400 dark:text-slate-700" aria-hidden="true">
                   ·
                 </span>
@@ -1393,13 +1428,24 @@ export default function App() {
                 {mode !== "finger" && (
                   <div>
                     <span className="block text-xs font-semibold text-slate-800 dark:text-slate-300 mb-2">
-                      خوارزمية استخلاص النبض
+                      خوارزمية استخلاص النبض (pyVHR / rPPG-Toolbox)
                     </span>
                     <div
                       dir="ltr"
-                      className="grid grid-cols-5 gap-1 p-1 bg-slate-100 dark:bg-[#080d16] border border-slate-300 dark:border-slate-800/90 rounded-lg"
+                      className="grid grid-cols-4 gap-1 p-1 bg-slate-100 dark:bg-[#080d16] border border-slate-300 dark:border-slate-800/90 rounded-lg"
                     >
-                      {(["FUSION", "POS", "CHROM", "ICA", "GREEN"] as RppgAlgorithm[]).map((algo) => (
+                      {(
+                        [
+                          "FUSION",
+                          "POS",
+                          "CHROM",
+                          "OMIT",
+                          "PBV",
+                          "LGI",
+                          "ICA",
+                          "GREEN",
+                        ] as RppgAlgorithm[]
+                      ).map((algo) => (
                         <button
                           key={algo}
                           type="button"
@@ -1424,12 +1470,17 @@ export default function App() {
                     {algorithm === "FUSION" && (
                       <div
                         dir="ltr"
-                        className="mt-2 flex items-center justify-between gap-2 text-[10px] font-mono text-slate-600 dark:text-slate-400 tabular-nums"
+                        className="mt-2 flex flex-col gap-0.5 text-[10px] font-mono text-slate-600 dark:text-slate-400 tabular-nums"
                       >
-                        <span className="shrink-0">Quad-Fusion</span>
-                        <span className="text-cyan-800 dark:text-cyan-300 truncate font-medium">
-                          POS {metrics.algoWeights.pos}% · CHROM {metrics.algoWeights.chrom}% · ICA {metrics.algoWeights.ica ?? 0}% · GRN {metrics.algoWeights.green}%
-                        </span>
+                        <div className="flex items-center justify-between">
+                          <span className="shrink-0">7-Way Consensus</span>
+                          <span className="text-cyan-800 dark:text-cyan-300 font-medium">
+                            POS {metrics.algoWeights.pos}% · CHROM {metrics.algoWeights.chrom}% · OMIT {metrics.algoWeights.omit ?? 0}%
+                          </span>
+                        </div>
+                        <div className="text-right text-slate-500 dark:text-slate-400">
+                          PBV {metrics.algoWeights.pbv ?? 0}% · LGI {metrics.algoWeights.lgi ?? 0}% · ICA {metrics.algoWeights.ica ?? 0}% · GRN {metrics.algoWeights.green}%
+                        </div>
                       </div>
                     )}
                   </div>
@@ -1959,7 +2010,7 @@ export default function App() {
                     ? `Apnea · ${(metrics.breathHoldSeconds ?? 0).toFixed(1)}s hold`
                     : metrics.respirationBrpm !== null
                     ? `SNR: ${metrics.respSnrDb.toFixed(1)} dB`
-                    : `${Math.min(12, metrics.bufferSeconds).toFixed(0)}/12s buffer`}
+                    : `${Math.min(10, metrics.bufferSeconds).toFixed(0)}/10s buffer`}
                 </p>
               </button>
 
@@ -2805,10 +2856,10 @@ export default function App() {
                 <li className="flex items-start gap-2.5">
                   <Sparkles className="w-4 h-4 text-cyan-700 dark:text-cyan-400 shrink-0 mt-0.5" />
                   <span>
-                    <strong className="text-slate-950 dark:text-white">محرك معالجة إشارات حي (30 Hz DSP):</strong>{" "}
-                    مبني من الصفر بلغة TypeScript لدعم الدمج الرباعي{" "}
-                    <span dir="ltr" className="font-mono text-cyan-800 dark:text-cyan-300 font-semibold">POS / CHROM / ICA / GREEN</span>{" "}
-                    مع تحويل طيفي <span dir="ltr" className="font-mono">1024-pt FFT</span>{" "}
+                    <strong className="text-slate-950 dark:text-white">محرك معالجة إشارات حي (30 Hz DSP) وتتبع 478 نقطة:</strong>{" "}
+                    مبني بدقة مع شبكات MediaPipe 478-Mesh ومزيج سباعي مفتوح المصدر{" "}
+                    <span dir="ltr" className="font-mono text-cyan-800 dark:text-cyan-300 font-semibold">POS / CHROM / OMIT / PBV / LGI / ICA / GREEN</span>{" "}
+                    مع تحويل طيفي <span dir="ltr" className="font-mono">2048-pt Welch FFT</span>{" "}
                     وتتبّع ديناميكي للجبهة والخدين.
                   </span>
                 </li>

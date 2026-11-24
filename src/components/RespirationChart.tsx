@@ -79,7 +79,7 @@ export function RespirationChart({
             ? `BREATH HOLD · ${breathHoldSeconds.toFixed(1)}s`
             : respirationBrpm !== null && respFreqHz !== null
             ? `${respirationBrpm} BrPM · SNR ${respSnrDb.toFixed(1)} dB`
-            : `${Math.min(12, bufferSeconds).toFixed(1)} / 12.0s`}
+            : `${Math.min(10, bufferSeconds).toFixed(1)} / 10.0s`}
         </div>
       </div>
 
