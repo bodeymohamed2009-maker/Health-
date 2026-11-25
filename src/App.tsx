@@ -264,6 +264,22 @@ export default function App() {
   const [isRunning, setIsRunning] = useState(false);
   const [isPausedByZone, setIsPausedByZone] = useState(false);
   const [zoneGuidance, setZoneGuidance] = useState<ZoneGuidance>("ok");
+  const [excessMotion, setExcessMotion] = useState(false);
+  const motionTrackerRef = useRef<{
+    emaMotion: number;
+    prevCx: number | null;
+    prevCy: number | null;
+    prevTilt: number | null;
+    highSince: number | null;
+    lastHigh: number;
+  }>({
+    emaMotion: 0,
+    prevCx: null,
+    prevCy: null,
+    prevTilt: null,
+    highSince: null,
+    lastHigh: 0,
+  });
   const [elapsedSec, setElapsedSec] = useState(0);
   const [torchEnabled, setTorchEnabled] = useState(false);
   const [torchSupported, setTorchSupported] = useState(false);
@@ -465,6 +481,15 @@ export default function App() {
     }
     setIsRunning(false);
     setIsPausedByZone(false);
+    setExcessMotion(false);
+    motionTrackerRef.current = {
+      emaMotion: 0,
+      prevCx: null,
+      prevCy: null,
+      prevTilt: null,
+      highSince: null,
+      lastHigh: 0,
+    };
     isPausedRef.current = false;
     pauseStartedAtRef.current = null;
     outOfZoneSinceRef.current = null;
@@ -566,6 +591,15 @@ export default function App() {
     coverScaleRef.current = { sx: 1, sy: 1 };
     setCoverScale({ sx: 1, sy: 1 });
     setIsPausedByZone(true);
+    setExcessMotion(false);
+    motionTrackerRef.current = {
+      emaMotion: 0,
+      prevCx: null,
+      prevCy: null,
+      prevTilt: null,
+      highSince: null,
+      lastHigh: 0,
+    };
     setZoneGuidance("no_face");
     setElapsedSec(0);
     setRoiBoxes([]);
@@ -699,6 +733,46 @@ export default function App() {
           setFaceBox(roi.faceBox);
           setZoneGuidance(roi.zoneGuidance);
           frameInZone = roi.inZone;
+
+          // Subtle Head-Motion Detection with hysteresis (luma delta + head pose velocity)
+          if (mode === "face" && roi.inZone) {
+            const mt = motionTrackerRef.current;
+            const dtSec = Math.max(0.016, dtMs / 1000);
+            const curTilt = roi.faceBox.headTiltDeg ?? 0;
+            let poseVel = 0;
+            if (mt.prevCx !== null && mt.prevCy !== null) {
+              const centerSpeed =
+                Math.hypot(roi.faceBox.cx - mt.prevCx, roi.faceBox.cy - mt.prevCy) /
+                dtSec;
+              const tiltSpeed =
+                mt.prevTilt !== null ? Math.abs(curTilt - mt.prevTilt) / dtSec : 0;
+              poseVel = centerSpeed * 42 + tiltSpeed * 0.14;
+            }
+            mt.prevCx = roi.faceBox.cx;
+            mt.prevCy = roi.faceBox.cy;
+            mt.prevTilt = curTilt;
+
+            const combinedMotion = Math.max(roi.motionIndex, poseVel);
+            mt.emaMotion = mt.emaMotion * 0.72 + combinedMotion * 0.28;
+            const isHighNow = mt.emaMotion >= 7.8 || roi.motionIndex >= 11.0;
+            if (isHighNow) {
+              mt.highSince ??= now;
+              mt.lastHigh = now;
+              if (now - mt.highSince >= 240) {
+                setExcessMotion((prev) => (prev ? prev : true));
+              }
+            } else {
+              mt.highSince = null;
+              if (now - mt.lastHigh >= 950) {
+                setExcessMotion((prev) => (prev ? false : prev));
+              }
+            }
+          } else {
+            motionTrackerRef.current.highSince = null;
+            motionTrackerRef.current.prevCx = null;
+            motionTrackerRef.current.prevCy = null;
+            setExcessMotion((prev) => (prev ? false : prev));
+          }
 
           // Auto-Pause / Seamless Resume Zone State Machine
           if (roi.inZone && (!isPausedRef.current || roi.hasValidTarget)) {
@@ -2335,7 +2409,7 @@ export default function App() {
                     const arm = 5.5;
                     const zoneStroke = !isRunning
                       ? "#475569"
-                      : isPausedByZone
+                      : isPausedByZone || excessMotion
                       ? "#f59e0b"
                       : metrics.signalState === "nominal"
                       ? "#10b981"
@@ -2510,6 +2584,30 @@ export default function App() {
                         <p className="text-[11px] text-slate-200 mt-0.5">
                           {getZoneGuidanceText(zoneGuidance, mode)}
                         </p>
+                      </div>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+
+                {/* Subtle Visual Head-Movement Stabilization Alert on Preview */}
+                <AnimatePresence>
+                  {isRunning && !isPausedByZone && mode === "face" && excessMotion && (
+                    <motion.div
+                      key="head-motion-alert"
+                      initial={{ opacity: 0, y: 6, scale: 0.97 }}
+                      animate={{ opacity: 1, y: 0, scale: 1 }}
+                      exit={{ opacity: 0, y: 6, scale: 0.97 }}
+                      transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
+                      role="status"
+                      aria-live="polite"
+                      className="pointer-events-none absolute inset-x-4 bottom-10 z-10 flex justify-center"
+                    >
+                      <div className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-amber-950/85 border border-amber-400/50 backdrop-blur-sm shadow-lg">
+                        <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse shrink-0" />
+                        <Activity className="w-3.5 h-3.5 text-amber-300 shrink-0" />
+                        <span className="text-[11px] font-semibold text-amber-100 whitespace-nowrap">
+                          حركة رأس زائدة — يُفضَّل الثبات للحصول على قراءة أدق
+                        </span>
                       </div>
                     </motion.div>
                   )}
