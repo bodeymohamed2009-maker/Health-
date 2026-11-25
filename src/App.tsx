@@ -15,7 +15,6 @@ import {
   Info,
   Moon,
   Play,
-  ShieldAlert,
   Sparkles,
   Square,
   Sun,
@@ -631,6 +630,8 @@ export default function App() {
         const caps = track.getCapabilities() as MediaTrackCapabilities & {
           torch?: boolean;
           whiteBalanceMode?: string[];
+          exposureMode?: string[];
+          focusMode?: string[];
         };
         if (caps.torch) {
           setTorchSupported(true);
@@ -649,6 +650,24 @@ export default function App() {
           try {
             await track.applyConstraints({
               advanced: [{ whiteBalanceMode: "manual" } as MediaTrackConstraintSet],
+            });
+          } catch {
+            // Optional hardware lock
+          }
+        }
+        if (caps.exposureMode?.includes("manual")) {
+          try {
+            await track.applyConstraints({
+              advanced: [{ exposureMode: "manual" } as MediaTrackConstraintSet],
+            });
+          } catch {
+            // Optional hardware lock
+          }
+        }
+        if (caps.focusMode?.includes("manual")) {
+          try {
+            await track.applyConstraints({
+              advanced: [{ focusMode: "manual" } as MediaTrackConstraintSet],
             });
           } catch {
             // Optional hardware lock
@@ -692,9 +711,9 @@ export default function App() {
       const canvas = analysisCanvasRef.current;
       if (video && canvas && video.readyState >= 2) {
         if (video.videoWidth > 0 && video.videoHeight > 0) {
-          const targetW = 240;
+          const targetW = 320;
           const targetH = Math.max(
-            120,
+            180,
             Math.round((targetW * video.videoHeight) / video.videoWidth)
           );
           if (canvas.width !== targetW || canvas.height !== targetH) {
@@ -1972,7 +1991,7 @@ export default function App() {
             className="lg:col-span-8 flex flex-col gap-5"
           >
             {/* 5-Card Interactive Biometric Telemetry Strip */}
-            <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-5 gap-4">
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
               {/* Focal Primary Heart Rate Card (Kalman BPM) */}
               <button
                 type="button"
@@ -2163,36 +2182,6 @@ export default function App() {
                   {statusBadge.label}
                 </p>
               </button>
-
-              {/* Honest SpO2 Limitation Card */}
-              <button
-                type="button"
-                aria-pressed={selectedMetric === "spo2"}
-                onClick={() =>
-                  setSelectedMetric((prev) => (prev === "spo2" ? null : "spo2"))
-                }
-                className={`text-right bg-white dark:bg-[#0c1322] border transition-all duration-200 rounded-xl p-4 col-span-2 md:col-span-1 cursor-pointer group ${
-                  selectedMetric === "spo2"
-                    ? "border-amber-600 dark:border-amber-400/70 ring-1 ring-amber-600/35 dark:ring-amber-400/35"
-                    : "border-slate-300 dark:border-slate-800/90 hover:border-slate-400 dark:hover:border-slate-700"
-                }`}
-              >
-                <div className="flex items-center justify-between text-xs text-slate-600 dark:text-slate-400 font-medium">
-                  <span>الأكسجين (SpO2)</span>
-                  <ShieldAlert className="w-4 h-4 text-amber-700 dark:text-amber-400" />
-                </div>
-                <div dir="ltr" className="mt-2 flex items-baseline gap-1.5">
-                  <span className="font-mono text-xl font-bold text-slate-800 dark:text-slate-300">
-                    N/A
-                  </span>
-                  <span className="font-mono text-[11px] text-slate-600 dark:text-slate-400">
-                    RGB Camera
-                  </span>
-                </div>
-                <p className="text-[11px] text-amber-800 dark:text-amber-300 font-semibold mt-1 leading-snug group-hover:text-amber-900 dark:group-hover:text-amber-200 transition-colors">
-                  يتطلب مستشعر 660/940nm
-                </p>
-              </button>
             </div>
 
             {/* Interactive Clinical Context Drawer for Selected Telemetry Card */}
@@ -2353,8 +2342,8 @@ export default function App() {
 
               <canvas
                 ref={analysisCanvasRef}
-                width={240}
-                height={180}
+                width={320}
+                height={240}
                 className="hidden"
               />
 

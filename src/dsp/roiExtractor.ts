@@ -1297,50 +1297,84 @@ export class RoiFrameExtractor {
       };
     };
 
-    const zones = hasFreshNeuralHint
+    const yaw = hasFreshNeuralHint && this.neuralHint ? this.neuralHint.yawRatio : 0;
+    // yaw > 0 => turned toward anatomical left/image-right (454/rightCheek occluded)
+    // yaw < 0 => turned toward anatomical right/image-left (234/leftCheek occluded)
+    const shrinkCheekYaw = (
+      box: { x0: number; y0: number; x1: number; y1: number },
+      side: "leftCheek" | "rightCheek"
+    ) => {
+      if (side === "rightCheek" && yaw > 0.24) {
+        const w = box.x1 - box.x0;
+        const trim = Math.min(0.45, (yaw - 0.2) * 1.4) * w;
+        return { ...box, x1: Math.max(box.x0 + 0.015, box.x1 - trim) };
+      }
+      if (side === "leftCheek" && yaw < -0.24) {
+        const w = box.x1 - box.x0;
+        const trim = Math.min(0.45, (-yaw - 0.2) * 1.4) * w;
+        return { ...box, x0: Math.min(box.x1 - 0.015, box.x0 + trim) };
+      }
+      return box;
+    };
+
+    const allZones = hasFreshNeuralHint
       ? [
           {
             key: "forehead" as const,
             ...this.neuralHint!.regions.forehead,
             label: "Forehead Mesh ROI",
+            occluded: false,
           },
           {
             key: "leftCheek" as const,
-            ...this.neuralHint!.regions.leftCheek,
+            ...shrinkCheekYaw(this.neuralHint!.regions.leftCheek, "leftCheek"),
             label: "Cheek L Mesh",
+            occluded: yaw < -0.40,
           },
           {
             key: "rightCheek" as const,
-            ...this.neuralHint!.regions.rightCheek,
+            ...shrinkCheekYaw(this.neuralHint!.regions.rightCheek, "rightCheek"),
             label: "Cheek R Mesh",
+            occluded: yaw > 0.40,
           },
         ]
       : [
-          buildTiltedZone(
-            "forehead",
-            0,
-            -0.55 * ry,
-            0.54 * rx,
-            0.17 * ry,
-            "Forehead ROI"
-          ),
-          buildTiltedZone(
-            "leftCheek",
-            -0.49 * rx,
-            0.195 * ry,
-            0.27 * rx,
-            0.205 * ry,
-            "Cheek L"
-          ),
-          buildTiltedZone(
-            "rightCheek",
-            0.49 * rx,
-            0.195 * ry,
-            0.27 * rx,
-            0.205 * ry,
-            "Cheek R"
-          ),
+          {
+            ...buildTiltedZone(
+              "forehead",
+              0,
+              -0.55 * ry,
+              0.54 * rx,
+              0.17 * ry,
+              "Forehead ROI"
+            ),
+            occluded: false,
+          },
+          {
+            ...buildTiltedZone(
+              "leftCheek",
+              -0.49 * rx,
+              0.195 * ry,
+              0.27 * rx,
+              0.205 * ry,
+              "Cheek L"
+            ),
+            occluded: false,
+          },
+          {
+            ...buildTiltedZone(
+              "rightCheek",
+              0.49 * rx,
+              0.195 * ry,
+              0.27 * rx,
+              0.205 * ry,
+              "Cheek R"
+            ),
+            occluded: false,
+          },
         ];
+
+    const zones = allZones.filter((z) => !z.occluded);
 
     let totalSumR = 0;
     let totalSumG = 0;

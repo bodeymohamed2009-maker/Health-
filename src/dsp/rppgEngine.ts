@@ -347,7 +347,33 @@ function applyNlmsAmbientCancel(
     return { cleaned: skin, reductionDb: 0 };
   }
 
+  // Least-squares zero-lag warm-start eliminates cold-start transient on the first 60–90 frames
+  let covDX = 0;
+  let varX = 1e-6;
+  for (let i = 0; i < N; i++) {
+    covDX += d[i] * x[i];
+    varX += x[i] * x[i];
+  }
   const w = new Float64Array(taps);
+  w[0] = Math.max(-0.25, Math.min(1.5, covDX / varX));
+
+  // Pre-train weights on backward pass so tap coefficients stabilize before sample 0
+  for (let n = N - 1; n >= 0; n--) {
+    let yHat = 0;
+    let normSq = 1e-4;
+    for (let k = 0; k < taps; k++) {
+      const xk = n + k < N ? x[n + k] : 0;
+      yHat += w[k] * xk;
+      normSq += xk * xk;
+    }
+    const err = d[n] - yHat;
+    const step = (mu * 0.65 * err) / normSq;
+    for (let k = 0; k < taps; k++) {
+      const xk = n + k < N ? x[n + k] : 0;
+      w[k] = Math.max(-1.6, Math.min(1.6, w[k] * 0.999 + step * xk));
+    }
+  }
+
   const cleaned = new Float64Array(N);
   let rawPower = 0;
   let cleanPower = 0;
@@ -362,11 +388,10 @@ function applyNlmsAmbientCancel(
     }
 
     const err = d[n] - yHat;
-    // Clamp adaptive error to preserve genuine skin reflectance
     const step = (mu * err) / normSq;
     for (let k = 0; k < taps; k++) {
       const xk = n - k >= 0 ? x[n - k] : 0;
-      w[k] += step * xk;
+      w[k] = Math.max(-1.6, Math.min(1.6, w[k] * 0.9995 + step * xk));
     }
 
     cleaned[n] = mSkin + err;
@@ -1766,27 +1791,54 @@ function extractBandpassedByAlgorithm(
   ];
 
   // 7-way inter-algorithm fundamental frequency consensus voting (±0.055 Hz ≈ ±3.3 BPM)
+  // Core specular-orthogonal extractors {POS, CHROM, OMIT, LGI} mathematically reject [1,1,1] luminance motion.
+  // PBV/ICA/GREEN retain sensitivity to [1,1,1] luminance shifts, so penalize them if they diverge from an agreed ortho core.
+  const strictOrthoFreqs = [freqs[0], freqs[1], freqs[2], freqs[4]];
+  let orthoClusterCount = 0;
+  for (let a = 0; a < strictOrthoFreqs.length; a++) {
+    let matches = 0;
+    for (let b = 0; b < strictOrthoFreqs.length; b++) {
+      if (a !== b && Math.abs(strictOrthoFreqs[a] - strictOrthoFreqs[b]) <= 0.06) {
+        matches++;
+      }
+    }
+    if (matches > orthoClusterCount) orthoClusterCount = matches;
+  }
+  const hasOrthoConsensus = orthoClusterCount >= 1; // >= 2 of {POS, CHROM, OMIT, LGI} agree
+
   const consensusScore = (idx: number) => {
     const fSelf = freqs[idx];
+    const isStrictOrtho = idx === 0 || idx === 1 || idx === 2 || idx === 4;
     let mult = 1.0;
     for (let j = 0; j < freqs.length; j++) {
-      if (j !== idx && Math.abs(fSelf - freqs[j]) <= 0.055) {
-        mult *= 1.12;
+      if (j === idx) continue;
+      const jStrictOrtho = j === 0 || j === 1 || j === 2 || j === 4;
+      if (Math.abs(fSelf - freqs[j]) <= 0.055) {
+        mult *= jStrictOrtho ? 1.28 : 1.08;
+      }
+    }
+    if (!isStrictOrtho && hasOrthoConsensus) {
+      const orthoAgree = strictOrthoFreqs.filter(
+        (fo) => Math.abs(fSelf - fo) <= 0.08
+      ).length;
+      if (orthoAgree === 0) {
+        mult *= 0.14;
       }
     }
     return mult;
   };
 
-  const snrTerm = (snrDb: number) =>
-    Math.exp(Math.max(-4, Math.min(18, snrDb)) / 3.0);
+  const snrTerm = (spec: { snrDb: number; purity: number }) =>
+    Math.exp(Math.max(-4, Math.min(11, spec.snrDb)) / 4.2) *
+    (0.75 + 0.50 * spec.purity);
 
-  const rawWPos = 1.18 * consensusScore(0) * snrTerm(sPos.snrDb);
-  const rawWChrom = 1.12 * consensusScore(1) * snrTerm(sChrom.snrDb);
-  const rawWOmit = 1.15 * consensusScore(2) * snrTerm(sOmit.snrDb);
-  const rawWPbv = 1.06 * consensusScore(3) * snrTerm(sPbv.snrDb);
-  const rawWLgi = 1.08 * consensusScore(4) * snrTerm(sLgi.snrDb);
-  const rawWIca = 0.92 * consensusScore(5) * snrTerm(sIca.snrDb);
-  const rawWGreen = 0.72 * consensusScore(6) * snrTerm(sGreen.snrDb);
+  const rawWPos = 1.24 * consensusScore(0) * snrTerm(sPos);
+  const rawWChrom = 1.18 * consensusScore(1) * snrTerm(sChrom);
+  const rawWOmit = 1.20 * consensusScore(2) * snrTerm(sOmit);
+  const rawWPbv = 1.06 * consensusScore(3) * snrTerm(sPbv);
+  const rawWLgi = 1.12 * consensusScore(4) * snrTerm(sLgi);
+  const rawWIca = 0.85 * consensusScore(5) * snrTerm(sIca);
+  const rawWGreen = 0.65 * consensusScore(6) * snrTerm(sGreen);
 
   const wSum =
     rawWPos +
@@ -2025,6 +2077,24 @@ function estimateAutocorrelationBpm(
 
   if (bestR < 0.25) return { bpm: null, periodicity: Math.max(0, bestR) };
 
+  // YIN/MPM octave-error guard: if bestLag ≈ 2*T (double period, half BPM) and halfLag also correlates strongly,
+  // pick the shorter period (true fundamental HR) rather than the 2T sub-harmonic alias.
+  const halfLag = Math.round(bestLag / 2);
+  if (halfLag >= minLag) {
+    let subBestLag = halfLag;
+    let subBestR = -1;
+    for (let k = Math.max(minLag, halfLag - 2); k <= Math.min(maxLag, halfLag + 2); k++) {
+      if (corr[k] > subBestR) {
+        subBestR = corr[k];
+        subBestLag = k;
+      }
+    }
+    if (subBestR >= bestR * 0.80 && subBestR >= 0.32) {
+      bestLag = subBestLag;
+      bestR = subBestR;
+    }
+  }
+
   // Sub-sample parabolic refinement on autocorrelation lag
   const rL = corr[bestLag - 1] ?? bestR;
   const rC = corr[bestLag];
@@ -2046,7 +2116,7 @@ function evaluateCardiacSpectrum(
 ) {
   const fftInputLen = Math.min(360, filtered.length);
   const fftSlice = filtered.slice(filtered.length - fftInputLen);
-  const fftSize = 2048;
+  const fftSize = 4096;
   const fullPower = fftReal(fftSlice, fftSize);
   const binResHz = fs / fftSize;
 
@@ -2110,14 +2180,14 @@ function evaluateCardiacSpectrum(
   }
 
   const candFreq = peakBin * binResHz;
-  if (candFreq > 1.6) {
+  if (candFreq > 1.72) {
     const subBin = Math.round(peakBin / 2);
     if (subBin >= minBin && subBin <= maxBin) {
       let localSubMax = 0;
       let localSubBin = subBin;
       for (
-        let k = Math.max(minBin, subBin - 2);
-        k <= Math.min(maxBin, subBin + 2);
+        let k = Math.max(minBin, subBin - 4);
+        k <= Math.min(maxBin, subBin + 4);
         k++
       ) {
         if (power[k] > localSubMax) {
@@ -2125,7 +2195,7 @@ function evaluateCardiacSpectrum(
           localSubBin = k;
         }
       }
-      if (localSubMax >= maxPower * 0.45) {
+      if (localSubMax >= maxPower * 0.58) {
         peakBin = localSubBin;
         maxPower = localSubMax;
       }
@@ -2151,12 +2221,19 @@ function evaluateCardiacSpectrum(
       Math.abs(fftBpm * 0.5 - acf.bpm) <= 6 &&
       acf.periodicity >= 0.62
     ) {
-      // Harmonic flip guard: ACF confirms true fundamental is half of 2nd-harmonic FFT peak
-      dominantFreqHz = acf.bpm / 60;
+      // Confirm true subharmonic energy in FFT before flipping down an octave
+      const halfBin = Math.round((fftBpm * 0.5) / 60 / binResHz);
+      let halfPow = 0;
+      for (let k = Math.max(minBin, halfBin - 4); k <= Math.min(maxBin, halfBin + 4); k++) {
+        if (power[k] > halfPow) halfPow = power[k];
+      }
+      if (halfPow >= power[peakBin] * 0.35) {
+        dominantFreqHz = acf.bpm / 60;
+      }
     }
   }
 
-  const halfWidthBins = Math.max(2, Math.round(0.15 / binResHz));
+  const halfWidthBins = Math.max(3, Math.round(0.15 / binResHz));
   let signalPower = 0;
   for (let i = minBin; i <= maxBin; i++) {
     const nearFund = Math.abs(i - peakBin) <= halfWidthBins;
@@ -2167,8 +2244,9 @@ function evaluateCardiacSpectrum(
   const snrDb = Number(
     (10 * Math.log10(Math.max(0.05, signalPower / noisePower))).toFixed(1)
   );
+  const purity = totalBandPower > 1e-12 ? Math.min(1, signalPower / totalBandPower) : 0;
 
-  return { power, binResHz, maxPower, dominantFreqHz, snrDb };
+  return { power, binResHz, maxPower, dominantFreqHz, snrDb, purity };
 }
 
 function computeFrequencyDomainLfHf(cleanIbisMs: number[]): number | null {
@@ -2216,6 +2294,18 @@ function computeFrequencyDomainLfHf(cleanIbisMs: number[]): number | null {
   return Number(Math.max(0.1, Math.min(9.9, lfPower / hfPower)).toFixed(2));
 }
 
+function catmullRomEval(p0: number, p1: number, p2: number, p3: number, t: number): number {
+  const t2 = t * t;
+  const t3 = t2 * t;
+  return (
+    0.5 *
+    (2 * p1 +
+      (-p0 + p2) * t +
+      (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 +
+      (-p0 + 3 * p1 - 3 * p2 + p3) * t3)
+  );
+}
+
 function detectSystolicPeaksAndPoincare(
   waveform: number[],
   fs: number,
@@ -2244,38 +2334,60 @@ function detectSystolicPeaksAndPoincare(
     };
   }
 
+  // 4x Catmull-Rom cubic spline upsampling (30 Hz -> 120 Hz effective grid, 8.33 ms resolution)
+  // eliminates asymmetric arterial peak rounding error before sub-sample parabolic interpolation
+  const UP = 4;
+  const fsHi = fs * UP;
+  const nHi = (N - 1) * UP + 1;
+  const hiWave = new Float64Array(nHi);
+  for (let i = 0; i < N - 1; i++) {
+    const p0 = waveform[Math.max(0, i - 1)];
+    const p1 = waveform[i];
+    const p2 = waveform[i + 1];
+    const p3 = waveform[Math.min(N - 1, i + 2)];
+    for (let u = 0; u < UP; u++) {
+      hiWave[i * UP + u] = catmullRomEval(p0, p1, p2, p3, u / UP);
+    }
+  }
+  hiWave[nHi - 1] = waveform[N - 1];
+
   const sigma = stdDev(waveform);
-  const threshold = sigma * 0.35;
+  const threshold = sigma * 0.34;
   // Adaptive refractory period locks out dicrotic notches using dominant heart rate
   const refractorySec =
     expectedBpm && expectedBpm >= 42 && expectedBpm <= 190
       ? Math.max(0.30, Math.min(0.68, 0.56 * (60 / expectedBpm)))
       : 0.34;
-  const minDist = Math.round(refractorySec * fs);
+  const minDistHi = Math.round(refractorySec * fsHi);
 
-  const candidates: number[] = [];
-  for (let i = 1; i < N - 1; i++) {
+  const candidatesHi: number[] = [];
+  for (let i = 1; i < nHi - 1; i++) {
     if (
-      waveform[i] > threshold &&
-      waveform[i] >= waveform[i - 1] &&
-      waveform[i] > waveform[i + 1]
+      hiWave[i] > threshold &&
+      hiWave[i] >= hiWave[i - 1] &&
+      hiWave[i] > hiWave[i + 1]
     ) {
-      if (candidates.length === 0) {
-        candidates.push(i);
+      if (candidatesHi.length === 0) {
+        candidatesHi.push(i);
       } else {
-        const last = candidates[candidates.length - 1];
-        if (i - last >= minDist) {
-          candidates.push(i);
-        } else if (waveform[i] > waveform[last]) {
-          candidates[candidates.length - 1] = i;
+        const last = candidatesHi[candidatesHi.length - 1];
+        if (i - last >= minDistHi) {
+          candidatesHi.push(i);
+        } else if (hiWave[i] > hiWave[last]) {
+          candidatesHi[candidatesHi.length - 1] = i;
         }
       }
     }
   }
 
-  if (candidates.length < 4) {
+  // Map high-resolution peak positions cleanly back to original waveform indices for UI dots/audio
+  const peakIndices = candidatesHi.map((idxHi) =>
+    Math.max(0, Math.min(N - 1, Math.round(idxHi / UP)))
+  );
+
+  if (candidatesHi.length < 4) {
     return {
-      peakIndices: candidates,
+      peakIndices,
       rmssdMs: null,
       sdnnMs: null,
       sd1Ms: null,
@@ -2286,21 +2398,21 @@ function detectSystolicPeaksAndPoincare(
     };
   }
 
-  // Sub-sample parabolic interpolation reduces 30Hz (33.3ms) quantization jitter in IBI/HRV
-  const refinedFractionalPeaks = candidates.map((idx) => {
-    if (idx <= 0 || idx >= N - 1) return idx;
-    const yL = waveform[idx - 1];
-    const yC = waveform[idx];
-    const yR = waveform[idx + 1];
+  // Sub-sample parabolic interpolation on 120 Hz grid yields ~±2 ms IBI/HRV timing precision
+  const refinedFractionalPeaks = candidatesHi.map((idxHi) => {
+    if (idxHi <= 0 || idxHi >= nHi - 1) return idxHi;
+    const yL = hiWave[idxHi - 1];
+    const yC = hiWave[idxHi];
+    const yR = hiWave[idxHi + 1];
     const denom = yL - 2 * yC + yR;
     const delta = Math.abs(denom) > 1e-9 ? (0.5 * (yL - yR)) / denom : 0;
-    return idx + Math.max(-0.5, Math.min(0.5, delta));
+    return idxHi + Math.max(-0.5, Math.min(0.5, delta));
   });
 
   const rawIbis: number[] = [];
   for (let i = 1; i < refinedFractionalPeaks.length; i++) {
     const ibiMs =
-      ((refinedFractionalPeaks[i] - refinedFractionalPeaks[i - 1]) / fs) * 1000;
+      ((refinedFractionalPeaks[i] - refinedFractionalPeaks[i - 1]) / fsHi) * 1000;
     if (ibiMs >= 330 && ibiMs <= 1450) {
       rawIbis.push(ibiMs);
     }
@@ -2308,7 +2420,7 @@ function detectSystolicPeaksAndPoincare(
 
   if (rawIbis.length < 3) {
     return {
-      peakIndices: candidates,
+      peakIndices,
       rmssdMs: null,
       sdnnMs: null,
       sd1Ms: null,
@@ -2321,14 +2433,16 @@ function detectSystolicPeaksAndPoincare(
 
   const sorted = [...rawIbis].sort((a, b) => a - b);
   const med = sorted[Math.floor(sorted.length / 2)];
+  const devs = sorted.map((v) => Math.abs(v - med)).sort((a, b) => a - b);
+  const mad = Math.max(12, devs[Math.floor(devs.length / 2)] * 1.4826);
   const cleanIbis = rawIbis.filter(
-    (v) => v >= med * 0.78 && v <= med * 1.22
+    (v) => v >= med * 0.78 && v <= med * 1.22 && Math.abs(v - med) <= 3.2 * mad
   );
   const cleanIbiRatio = cleanIbis.length / Math.max(1, rawIbis.length);
 
   if (cleanIbis.length < 3) {
     return {
-      peakIndices: candidates,
+      peakIndices,
       rmssdMs: null,
       sdnnMs: null,
       sd1Ms: null,
@@ -2349,7 +2463,7 @@ function detectSystolicPeaksAndPoincare(
     const a = cleanIbis[i - 1];
     const b = cleanIbis[i];
     const d = b - a;
-    if (Math.abs(d) > med * 0.24) continue;
+    if (Math.abs(d) > med * 0.22) continue;
     sqDiffSum += d * d;
     validPairCount++;
     poincarePoints.push({
@@ -2362,7 +2476,7 @@ function detectSystolicPeaksAndPoincare(
 
   if (validPairCount < 2) {
     return {
-      peakIndices: candidates,
+      peakIndices,
       rmssdMs: null,
       sdnnMs: null,
       sd1Ms: null,
@@ -2380,7 +2494,7 @@ function detectSystolicPeaksAndPoincare(
   const lfHfRatio = computeFrequencyDomainLfHf(cleanIbis);
 
   return {
-    peakIndices: candidates,
+    peakIndices,
     rmssdMs,
     sdnnMs,
     sd1Ms,
@@ -2569,6 +2683,45 @@ function filterAnchorOutliers(
   }));
 }
 
+function interpolateAnchorsCatmullRom(
+  anchors: Array<{ idx: number; val: number }>,
+  outLen: number
+): Float64Array {
+  const out = new Float64Array(outLen);
+  if (anchors.length === 0) return out;
+  if (anchors.length === 1) {
+    out.fill(anchors[0].val);
+    return out;
+  }
+  let aIdx = 0;
+  for (let i = 0; i < outLen; i++) {
+    if (i <= anchors[0].idx) {
+      out[i] = anchors[0].val;
+    } else if (i >= anchors[anchors.length - 1].idx) {
+      out[i] = anchors[anchors.length - 1].val;
+    } else {
+      while (aIdx < anchors.length - 2 && anchors[aIdx + 1].idx < i) aIdx++;
+      const b0 = anchors[Math.max(0, aIdx - 1)];
+      const b1 = anchors[aIdx];
+      const b2 = anchors[aIdx + 1];
+      const b3 = anchors[Math.min(anchors.length - 1, aIdx + 2)];
+      const span = b2.idx - b1.idx || 1;
+      const t = (i - b1.idx) / span;
+      const interp = catmullRomEval(b0.val, b1.val, b2.val, b3.val, t);
+      const lin = b1.val + t * (b2.val - b1.val);
+      const lo = Math.min(b1.val, b2.val);
+      const hi = Math.max(b1.val, b2.val);
+      const overshootAllowance = Math.max(1e-6, (hi - lo) * 0.25);
+      // Bounded Catmull-Rom prevents spline ringing while keeping smooth RSA respiratory inflection
+      out[i] = Math.max(
+        lo - overshootAllowance,
+        Math.min(hi + overshootAllowance, 0.75 * interp + 0.25 * lin)
+      );
+    }
+  }
+  return out;
+}
+
 function estimateRespiration(
   r30: Float64Array,
   g30: Float64Array,
@@ -2578,7 +2731,8 @@ function estimateRespiration(
   algorithm: RppgAlgorithm,
   mode: CaptureMode,
   signalState: SignalQualityState,
-  respTracker?: RespirationTracker
+  respTracker?: RespirationTracker,
+  priorBpm?: number | null
 ): {
   respirationBrpm: number | null;
   respSnrDb: number;
@@ -2605,12 +2759,27 @@ function estimateRespiration(
     };
   }
 
-  const rawBvp = selectBvpSignal(r30, g30, b30, algorithm, mode, TARGET_FS);
-  const detrendedBvp = detrendSlidingMean(rawBvp, Math.round(TARGET_FS * 0.75));
-  const cardiacBvp = zeroPhaseBandpass(detrendedBvp, TARGET_FS, 0.7, 3.5);
+  // Use 7-way consensus fused BVP across the full respiratory window when algorithm === "FUSION"
+  // instead of noisy single-extractor signal so RIAV & RSA/RIFV inherit full +3 dB fusion clarity
+  const cardiacBvp =
+    algorithm === "FUSION" && mode !== "finger"
+      ? extractBandpassedByAlgorithm(r30, g30, b30, algorithm, mode, TARGET_FS, priorBpm).filtered
+      : zeroPhaseBandpass(
+          detrendSlidingMean(
+            selectBvpSignal(r30, g30, b30, algorithm, mode, TARGET_FS),
+            Math.round(TARGET_FS * 0.75)
+          ),
+          TARGET_FS,
+          0.7,
+          3.5
+        );
 
   const sigmaCard = stdDev(cardiacBvp) || 1;
-  const minPeakDist = Math.round(0.32 * TARGET_FS);
+  const refractorySec =
+    priorBpm && priorBpm >= 42 && priorBpm <= 190
+      ? Math.max(0.30, Math.min(0.64, 0.54 * (60 / priorBpm)))
+      : 0.32;
+  const minPeakDist = Math.round(refractorySec * TARGET_FS);
   const peakIdx: number[] = [];
   for (let i = 1; i < N - 1; i++) {
     if (
@@ -2631,6 +2800,17 @@ function estimateRespiration(
     }
   }
 
+  // Sub-sample parabolic refinement removes ±33.3 ms step quantization sawtooth (~±3 BPM jitter) from RIFV/RSA
+  const peakFrac = peakIdx.map((pk) => {
+    if (pk <= 0 || pk >= N - 1) return pk;
+    const yL = cardiacBvp[pk - 1];
+    const yC = cardiacBvp[pk];
+    const yR = cardiacBvp[pk + 1];
+    const denom = yL - 2 * yC + yR;
+    const delta = Math.abs(denom) > 1e-9 ? (0.5 * (yL - yR)) / denom : 0;
+    return pk + Math.max(-0.5, Math.min(0.5, delta));
+  });
+
   const rawAmpAnchors: Array<{ idx: number; val: number }> = [];
   const rawHrAnchors: Array<{ idx: number; val: number }> = [];
 
@@ -2645,7 +2825,7 @@ function estimateRespiration(
     rawAmpAnchors.push({ idx: pk, val: Math.max(0, cardiacBvp[pk] - minVal) });
 
     if (p > 0) {
-      const dtSec = (pk - peakIdx[p - 1]) / TARGET_FS;
+      const dtSec = (peakFrac[p] - peakFrac[p - 1]) / TARGET_FS;
       if (dtSec >= 0.33 && dtSec <= 1.45) {
         rawHrAnchors.push({ idx: pk, val: 60 / dtSec });
       }
@@ -2655,23 +2835,11 @@ function estimateRespiration(
   const ampAnchors = filterAnchorOutliers(rawAmpAnchors, 0, Infinity, 3.0);
   const hrAnchors = filterAnchorOutliers(rawHrAnchors, 40, 195, 2.8);
 
-  const riav30 = new Float64Array(N);
+  let riav30: Float64Array;
   if (ampAnchors.length >= 4) {
-    let aIdx = 0;
-    for (let i = 0; i < N; i++) {
-      if (i <= ampAnchors[0].idx) {
-        riav30[i] = ampAnchors[0].val;
-      } else if (i >= ampAnchors[ampAnchors.length - 1].idx) {
-        riav30[i] = ampAnchors[ampAnchors.length - 1].val;
-      } else {
-        while (aIdx < ampAnchors.length - 2 && ampAnchors[aIdx + 1].idx < i) aIdx++;
-        const b0 = ampAnchors[aIdx];
-        const b1 = ampAnchors[aIdx + 1];
-        const t = (i - b0.idx) / (b1.idx - b0.idx || 1);
-        riav30[i] = b0.val + t * (b1.val - b0.val);
-      }
-    }
+    riav30 = interpolateAnchorsCatmullRom(ampAnchors, N);
   } else {
+    riav30 = new Float64Array(N);
     const halfWin = Math.round(0.35 * TARGET_FS);
     for (let i = 0; i < N; i++) {
       let acc = 0,
@@ -2684,24 +2852,10 @@ function estimateRespiration(
     }
   }
 
-  const rifv30 = new Float64Array(N);
   const hasRifv = hrAnchors.length >= 5;
-  if (hasRifv) {
-    let hIdx = 0;
-    for (let i = 0; i < N; i++) {
-      if (i <= hrAnchors[0].idx) {
-        rifv30[i] = hrAnchors[0].val;
-      } else if (i >= hrAnchors[hrAnchors.length - 1].idx) {
-        rifv30[i] = hrAnchors[hrAnchors.length - 1].val;
-      } else {
-        while (hIdx < hrAnchors.length - 2 && hrAnchors[hIdx + 1].idx < i) hIdx++;
-        const h0 = hrAnchors[hIdx];
-        const h1 = hrAnchors[hIdx + 1];
-        const t = (i - h0.idx) / (h1.idx - h0.idx || 1);
-        rifv30[i] = h0.val + t * (h1.val - h0.val);
-      }
-    }
-  }
+  const rifv30 = hasRifv
+    ? interpolateAnchorsCatmullRom(hrAnchors, N)
+    : new Float64Array(N);
 
   const stride = TARGET_FS / RESP_FS;
   const outLen = Math.floor(N / stride);
@@ -2976,8 +3130,8 @@ function estimateRespiration(
     }
   }
 
-  // Hann-windowed FFT + Welch segment blend for higher BrPM spectral precision
-  const fftSize = 512;
+  // Hann-windowed 1024-pt FFT (0.234 BrPM/bin) + Welch segment blend + subharmonic guard
+  const fftSize = 1024;
   const fullPower = computeHannPower(fused, fftSize);
   let power = fullPower;
   const welchWin = Math.round(RESP_FS * 12);
@@ -3029,6 +3183,30 @@ function estimateRespiration(
     }
   }
 
+  // Prevent 2x respiratory harmonic locking when true slow breathing (e.g. 12 BrPM -> 24 BrPM) is present
+  const candRespFreq = peakBin * binResHz;
+  if (candRespFreq > 0.30) {
+    const subBin = Math.round(peakBin / 2);
+    if (subBin >= minBin && subBin <= maxBin) {
+      let localSubMax = 0;
+      let localSubBin = subBin;
+      for (
+        let k = Math.max(minBin, subBin - 4);
+        k <= Math.min(maxBin, subBin + 4);
+        k++
+      ) {
+        if (power[k] > localSubMax) {
+          localSubMax = power[k];
+          localSubBin = k;
+        }
+      }
+      if (localSubMax >= power[peakBin] * 0.50) {
+        peakBin = localSubBin;
+        maxPower = localSubMax;
+      }
+    }
+  }
+
   const pL = power[peakBin - 1] ?? 0;
   const pC = power[peakBin] ?? 0;
   const pR = power[peakBin + 1] ?? 0;
@@ -3047,7 +3225,7 @@ function estimateRespiration(
     rawBrpm = Math.round(0.65 * rawBrpm + 0.35 * fullAutocorr.brpm);
   }
 
-  const halfBins = Math.max(2, Math.round(0.05 / binResHz));
+  const halfBins = Math.max(3, Math.round(0.05 / binResHz));
   let sigPower = 0;
   for (let i = minBin; i <= maxBin; i++) {
     if (Math.abs(i - peakBin) <= halfBins) sigPower += power[i];
@@ -3494,7 +3672,8 @@ export function analyzeRppgBuffer(
     algorithm,
     mode,
     signalState,
-    options?.respTracker
+    options?.respTracker,
+    kalmanBpm ?? rawEstimatedBpm
   );
 
   return {

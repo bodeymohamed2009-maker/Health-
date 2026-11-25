@@ -1,9 +1,9 @@
 import { motion } from "motion/react";
-import { Activity, ShieldAlert, Sparkles, Waves, Wind, X } from "lucide-react";
+import { Activity, Sparkles, Waves, Wind, X } from "lucide-react";
 import { getAgeAdjustedNorms } from "../dsp/hrvTrends";
 import type { BiometricProfile, RppgMetrics } from "../types/rppg";
 
-export type MetricInspectorKey = "bpm" | "resp" | "coherence" | "quality" | "spo2";
+export type MetricInspectorKey = "bpm" | "resp" | "coherence" | "quality";
 
 interface MetricInspectorDrawerProps {
   selected: MetricInspectorKey;
@@ -93,7 +93,8 @@ export function MetricInspectorDrawer({
           onAction: () => onFocusTab("autonomic"),
         };
       }
-      case "quality": {
+      case "quality":
+      default: {
         const sqi = metrics.sqiPct ?? 0;
         return {
           icon: <Waves className="w-4 h-4 text-cyan-700 dark:text-cyan-300" />,
@@ -114,21 +115,6 @@ export function MetricInspectorDrawer({
           onAction: () => onFocusTab("trends"),
         };
       }
-      case "spo2":
-      default:
-        return {
-          icon: <ShieldAlert className="w-4 h-4 text-amber-700 dark:text-amber-300" />,
-          title: "حدود فيزيائية: لماذا لا يعرض النظام SpO2؟",
-          subtitle:
-            "قياس تشبع الأكسجين بدقة يتطلب إضاءة مزدوجة الطول الموجي (أحمر 660 nm وأشعة تحت حمراء 940 nm)، بينما تمنع عدسات الهواتف وكاميرات الويب الأشعة تحت الحمراء بمرشح IR-Cut.",
-          rangeLabel: "IR 940nm غير متاح في كاميرات RGB",
-          markerPct: null,
-          barColor: "bg-amber-600 dark:bg-amber-400",
-          actionLabel: "اقرأ المنهجية العلمية",
-          onAction: () => {
-            document.getElementById("science")?.scrollIntoView({ behavior: "smooth" });
-          },
-        };
     }
   };
 
